@@ -4,10 +4,17 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// uoActive reports whether unordered packet delivery is in
+// effect for this Conn (experiment flag, packet mode only).
+func (c *Conn) uoActive() bool {
+	return c.opts.PacketOutOfOrder && c.opts.Mode == ModePacket
+}
 
 // Mode selects how the application payload maps to shards.
 type Mode int
@@ -35,6 +42,31 @@ type Options struct {
 	// when the Conn is closed (DESIGN.md 5.4: per-connection
 	// shaping overhead must be observable).
 	OnClose func(Stats)
+
+	// --- experiment fields (flagged observations, 2026-11-05) ---
+	// All default to the milestone-2 production behaviour; they
+	// exist so the treatments in experiment.go's README verdicts
+	// can be measured in the fixed harness and the e2e. They are
+	// measurement scaffolding, not product surface.
+
+	// PacketOutOfOrder (packet mode only): deliver each group as
+	// soon as it resolves instead of in strict group order, so a
+	// fully-lost group no longer stalls recoverable data behind
+	// it (partial preservation, DESIGN.md 5.2). Stream mode
+	// ignores it: a byte stream cannot skip.
+	PacketOutOfOrder bool
+	// EagerGapSynthesis: declare a never-seen group lost as soon
+	// as a later group's arrival proves it (the record carrier is
+	// ordered, so a later record is proof the earlier slot's
+	// records were dropped), instead of waiting for arrivals to
+	// pause for a full GroupTimeout. This feeds feedback — and
+	// ordered delivery — mid-stream instead of after pauses.
+	EagerGapSynthesis bool
+	// GapProofGrace is how long after that proof the eager
+	// declaration waits; 0 fires at the first expiry tick. It
+	// exists for future unordered carriers (QUIC datagrams),
+	// where reordering makes instant proof unsound.
+	GapProofGrace time.Duration
 }
 
 func (o *Options) applyDefaults() {
@@ -122,6 +154,16 @@ type Conn struct {
 	readErr      error
 	readBuf      []byte
 
+	// Experiment state (only touched when the matching Options
+	// flag is on): uoDelivered tracks groups already handed to
+	// the consumer out of order, feeding the stale-record guard;
+	// gapProof* records when a later group first proved the
+	// cursor group never arrived.
+	uoDelivered  map[uint32]bool
+	gapProofSet  bool
+	gapProofFor  uint32
+	gapProofTime time.Time
+
 	stats struct {
 		appOut     atomic.Uint64
 		wireOut    atomic.Uint64
@@ -155,6 +197,9 @@ func NewConn(conn net.Conn, codec Codec, ctrl Controller, opts Options) *Conn {
 		recvDone:   make(chan struct{}),
 		recvGroups: make(map[uint32]*recvGroup),
 		pending:    make(map[uint32]*groupResult),
+	}
+	if c.uoActive() {
+		c.uoDelivered = make(map[uint32]bool)
 	}
 	go c.sendLoop()
 	go c.recvLoop()
@@ -488,9 +533,27 @@ func (c *Conn) handleShardRecord(rec record) {
 	if _, resolved := c.pending[rec.group]; resolved {
 		return
 	}
+	if c.uoActive() && c.uoDelivered[rec.group] {
+		return
+	}
 	if rec.group > c.maxGroupSeen {
 		c.maxGroupSeen = rec.group
 		c.maxGroupTime = time.Now()
+	}
+	// Eager gap proof (experiment): on this ordered carrier, a
+	// record of a later group proves the cursor group's records
+	// were all dropped if that group has no trace anywhere.
+	// Record when the proof was first observed; the expiry loop
+	// turns it into a lost-group declaration without waiting
+	// for an arrival pause.
+	if c.opts.EagerGapSynthesis && c.deliverNext < rec.group {
+		if _, ok := c.recvGroups[c.deliverNext]; !ok {
+			if !c.gapProofSet || c.gapProofFor != c.deliverNext {
+				c.gapProofSet = true
+				c.gapProofFor = c.deliverNext
+				c.gapProofTime = time.Now()
+			}
+		}
 	}
 	// A record of a newer group closes all older open groups.
 	for id, g := range c.recvGroups {
@@ -624,14 +687,23 @@ func (c *Conn) resolveLocked(id uint32, g *recvGroup) {
 	c.pending[id] = res
 }
 
-// pumpDeliverLocked moves consecutively resolved groups into the
-// delivered channel in group order. Caller holds recvMu. Delivery
-// blocks if the consumer is slow: that backpressure is intended,
-// but it must not hold recvMu while blocked, so this is only called
-// with results ready and a buffered channel; if the channel is
-// full we return and retry on the next event.
+// pumpDeliverLocked moves resolved groups into the delivered
+// channel. Caller holds recvMu. Delivery blocks if the consumer
+// is slow: that backpressure is intended, but it must not hold
+// recvMu while blocked, so this is only called with results
+// ready and a buffered channel; if the channel is full we return
+// and retry on the next event. With the PacketOutOfOrder
+// experiment flag the packet-mode variant runs instead: every
+// resolved group is delivered as soon as it resolves, in
+// resolution order, and deliverNext degrades to a pure
+// accounting cursor (gap synthesis still walks it so fully-lost
+// groups are accounted exactly once).
 func (c *Conn) pumpDeliverLocked() {
 	if c.recvFinished {
+		return
+	}
+	if c.uoActive() {
+		c.pumpDeliverUOLocked()
 		return
 	}
 	for {
@@ -656,6 +728,61 @@ func (c *Conn) pumpDeliverLocked() {
 	}
 }
 
+// pumpDeliverUOLocked is the unordered packet-mode pump
+// (experiment): deliver every resolved group now, lowest ID first
+// for determinism, regardless of gaps at the cursor. Feedback
+// accounting is unaffected — it happens in resolveLocked when a
+// group resolves, not here. Caller holds recvMu.
+func (c *Conn) pumpDeliverUOLocked() {
+	ids := make([]uint32, 0, len(c.pending))
+	for id := range c.pending {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		res := c.pending[id]
+		for res.delivered < len(res.messages) {
+			select {
+			case c.delivered <- res.messages[res.delivered]:
+				c.stats.appIn.Add(uint64(len(res.messages[res.delivered])))
+				res.delivered++
+			default:
+				c.advanceCursorUOLocked()
+				return // channel full; progress kept in res.delivered
+			}
+		}
+		delete(c.pending, id)
+		c.uoDelivered[id] = true
+	}
+	c.advanceCursorUOLocked()
+}
+
+// advanceCursorUOLocked moves the accounting cursor past groups
+// already delivered out of order, so gap synthesis only ever
+// synthesises slots nobody has accounted for. Caller holds
+// recvMu.
+func (c *Conn) advanceCursorUOLocked() {
+	for c.uoDelivered[c.deliverNext] {
+		c.deliverNext++
+	}
+}
+
+// synthesiseGapLocked declares the cursor group fully lost
+// without any record of it ever arriving, accounting it as one
+// unit (exact for raw and k=1 groups, a floor for fully-lost
+// shard groups). Caller holds recvMu.
+func (c *Conn) synthesiseGapLocked() {
+	res := &groupResult{expected: 1, lost: 1}
+	if c.opts.Mode == ModeStream {
+		res.fatal = true
+	}
+	c.feedbackAcc.Expected++
+	c.feedbackAcc.Lost++
+	c.stats.lost.Add(1)
+	c.stats.groupsRecv.Add(1)
+	c.pending[c.deliverNext] = res
+}
+
 func (c *Conn) expiryLoop() {
 	ticker := time.NewTicker(c.opts.GroupTimeout / 2)
 	defer ticker.Stop()
@@ -676,24 +803,39 @@ func (c *Conn) expiryLoop() {
 			// a full timeout to arrive, declare it lost (counted
 			// as one unit: exact for raw groups, a floor for fully
 			// lost shard groups, which need every record dropped).
-			for c.started && c.deliverNext < c.maxGroupSeen &&
-				now.Sub(c.maxGroupTime) > c.opts.GroupTimeout {
+			// The EagerGapSynthesis experiment adds a second trigger:
+			// a later group's arrival already proved this slot lost
+			// (ordered carrier), so declare it once the proof is
+			// older than GapProofGrace — no arrival pause needed.
+			for c.started && c.deliverNext < c.maxGroupSeen {
 				if _, ok := c.pending[c.deliverNext]; ok {
 					break
 				}
 				if _, ok := c.recvGroups[c.deliverNext]; ok {
 					break
 				}
-				before := c.deliverNext
-				res := &groupResult{expected: 1, lost: 1}
-				if c.opts.Mode == ModeStream {
-					res.fatal = true
+				// Chained gaps: when the pump just advanced the
+				// cursor past a synthesised gap, the next missing
+				// slot is *already* proven lost (a later group was
+				// seen before this tick), even though no record has
+				// arrived since it became the cursor. Establish its
+				// proof now (grace restarts — conservative) so one
+				// tick clears the whole run of gaps instead of one
+				// gap per tick.
+				if c.opts.EagerGapSynthesis &&
+					(!c.gapProofSet || c.gapProofFor != c.deliverNext) {
+					c.gapProofSet = true
+					c.gapProofFor = c.deliverNext
+					c.gapProofTime = now
 				}
-				c.feedbackAcc.Expected++
-				c.feedbackAcc.Lost++
-				c.stats.lost.Add(1)
-				c.stats.groupsRecv.Add(1)
-				c.pending[c.deliverNext] = res
+				eager := c.opts.EagerGapSynthesis && c.gapProofSet &&
+					c.gapProofFor == c.deliverNext &&
+					now.Sub(c.gapProofTime) >= c.opts.GapProofGrace
+				if !eager && now.Sub(c.maxGroupTime) <= c.opts.GroupTimeout {
+					break
+				}
+				before := c.deliverNext
+				c.synthesiseGapLocked()
 				c.pumpDeliverLocked()
 				if c.deliverNext == before {
 					break // delivered channel full; retry next tick

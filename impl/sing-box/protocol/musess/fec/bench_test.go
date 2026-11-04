@@ -235,6 +235,17 @@ const settleWindow = 2 * time.Second
 const hardDeadline = 30 * time.Second
 
 func runTransfer(t *testing.T, codec Codec, ctrl Controller, loss float64, burst bool, offeredMbps float64, linkMbps float64, count int, size int, seed int64) benchResult {
+	return runTransferMod(t, codec, ctrl, loss, burst, offeredMbps, linkMbps, count, size, seed, nil)
+}
+
+// runTransferMod is runTransfer with an optional Options modifier
+// applied to both ends before the Conns are built. It exists for
+// the flagged-observation experiments (exp_bench_test.go), which
+// need the endpoint experiment flags varied per arm. The fixed
+// harness's accounting is unchanged: a nil modifier reproduces
+// runTransfer exactly, and every established entry point calls
+// runTransfer.
+func runTransferMod(t *testing.T, codec Codec, ctrl Controller, loss float64, burst bool, offeredMbps float64, linkMbps float64, count int, size int, seed int64, mod func(*Options)) benchResult {
 	t.Helper()
 	a, b := net.Pipe()
 	// Service time per record emulates the link rate for records
@@ -264,6 +275,9 @@ func runTransfer(t *testing.T, codec Codec, ctrl Controller, loss float64, burst
 		FlushInterval:    5 * time.Millisecond, // production default
 		FeedbackInterval: 100 * time.Millisecond,
 		GroupTimeout:     150 * time.Millisecond,
+	}
+	if mod != nil {
+		mod(&opts)
 	}
 	sender := NewConn(shimAB, codec, ctrl, opts)
 	receiver := NewConn(shimBA, codec, staticController{}, opts)

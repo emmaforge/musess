@@ -1061,6 +1061,304 @@ for the cap decision; no change made.
    spike after pauses; any future interactive-traffic FEC
    behaviour must reckon with this accounting shape.
 
+### Flagged observations: design treatment (2026-11-05)
+
+The three observations above were analysed, prototyped behind
+experiment flags, and measured in the fixed harness (paired
+seeds, 3 reps per cell, medians; runs sequential, host load
+checked <0.5 on 4 cores before each bench; logs in
+`.tmp/exp-obs/`). Production defaults are unchanged: the
+treatments live behind `fec.NewControllerWithYieldPolicy`,
+the `Options` experiment fields (`PacketOutOfOrder`,
+`EagerGapSynthesis`, `GapProofGrace`), and — for e2e only —
+the `MUSESS_FEC_EXP` environment variable read in
+`fecwire.go` (unset = production options exactly). As a
+behaviour-neutral check on the endpoint refactor this work
+required, today's production arms reproduce the harness-fix
+tables almost exactly (bulk rs+estimator at 5%: delivery
+97.28 vs 97.28, overhead 7.38 vs 7.41; saturation production
+96.88 vs ~96.9; trickle production p50 1555 ms vs ~1.5 s).
+
+#### Observation 1 — yield-wrapper depth
+
+Mechanism: the wrapper's factor halves per feedback window
+while the FEC send queue exceeds 256 KiB, floored at 0.2,
+recovering ×1.5/window; three backlogged windows reach the
+floor, and applied redundancy = inner × 0.2 regardless of the
+loss the feedback is reporting (at 20% loss: capped inner
+0.15 → applied 0.03, one parity per k=16 group against ~3.2
+expected losses per group). The schedule is a function of
+backlog duration only. It bites on bulk transfers over links
+that are simultaneously saturated and lossy (the foreign→China
+downlink at peak), and the signal is a proxy: queue depth also
+fires for producer bursts and slow receivers, which the
+wrapper cannot distinguish from link saturation.
+
+Treatments prototyped: **(A) loss-aware yield floor** — yield
+may trim only the margin above a measured-loss cover,
+cover = p/(1+p) from the wrapper's own feedback EWMA (the
+parity fraction at which a group carries as many parity
+shards as its expected losses); **(B) shallower blind floor**
+(factor floor 0.4). A harness-side fidelity gate came first:
+the experimental wrapper with a zero policy reproduces the
+production controller's output exactly on a scripted
+feedback/backlog sequence (unit test) and on the saturation
+cell its per-rep rows are identical to production's
+(delivery 96.88, overhead 5.90 — the clone is the same
+controller, not a near miss).
+
+Saturation cell (100 into 23 Mbps, 5% loss), medians
+(ranges) over 3 reps:
+
+| arm | delivery % | goodput Mbps | overhead % |
+|---|---|---|---|
+| production (floor 0.2, blind) | 96.88 (96.45–97.22) | 8.49 | 5.90 |
+| yield-clone (fidelity) | 96.88 | 8.52 | 5.90 |
+| loss-aware floor | 97.15 (96.65–97.20) | 8.25 | 6.35 |
+| blind floor 0.4 | 96.88 | 8.54 | 5.90 |
+
+On the saturation cell the differences are small: the
+loss-aware floor's +0.27pt delivery sits inside overlapping
+ranges, its overhead is +0.45pt, and its goodput is
+nominally the lowest of the four arms. The blind 0.4 floor
+never differentiates from production in these cells at all
+(per-rep deliveries identical) — the factor evidently does
+not bind below 0.4 long enough here for the floor value to
+matter, so this rig says nothing for or against it.
+
+The unsaturated spot cells (43% headroom link) are where
+the cover actually binds — transient backlogs in this rig
+engage the production yield even without a saturated link,
+and the cover blocks that throttling:
+
+| loss | arm | delivery % | goodput Mbps | overhead % |
+|---|---|---|---|---|
+| 5% | production | 97.40 | 8.38 | 7.42 |
+| 5% | loss-aware | 97.40 | 8.45 | 7.40 |
+| 10% | production | 93.42 | 8.13 | 9.39 |
+| 10% | loss-aware | 95.43 | 8.22 | 13.06 |
+| 20% | production | 82.00 | 7.83 | 10.22 |
+| 20% | loss-aware | 85.40 | 7.70 | 16.52 |
+
+At 5% the two are indistinguishable. At 10–20% the cover
+buys real delivery (**+2.01pt at 10%, +3.40pt at 20%**) at
+real cost (**+3.67pt / +6.30pt overhead**), and goodput does
+not follow (+0.09 / −0.13 Mbps): in this rig goodput is
+receiver-paced, so recovered shards do not convert into
+throughput the way they would where a loss means an
+upper-layer retransmission stall. The mechanism is proven —
+the cover demonstrably spends, and delivers, exactly where
+the blind yield was collapsing protection — but the *net*
+value is not established here: on Emma's first-priority
+metric (goodput) the measured gain is zero.
+
+**Verdict: defer.** Do not change the production yield
+wrapper on this evidence. What is missing is a test where
+recovery converts to goodput under combined saturation and
+loss — a real saturated lossy link, or the QUIC datagram
+path where FEC recovery is load-bearing — which is the
+same missing input as the signal question below (queue
+depth vs true wire saturation). If that test shows the
+cover's delivery gains converting to goodput, the
+prototyped change is ready to land as-is; if it shows the
+overhead crowding out data on a truly saturated link, the
+production collapse is the lesser evil and this becomes
+accept-and-document. Signal hygiene stays open for the
+same reason: it needs the real saturated-link test this
+rig cannot provide.
+
+#### Observation 2 — ordered-delivery head-of-line stall
+
+Mechanism: one delivery cursor (`pumpDeliverLocked`) serves
+both modes; a fully-lost group has no receiver-side trace, so
+the cursor waits for gap synthesis, whose trigger is an
+arrival *pause* longer than GroupTimeout (every new group
+refreshes `maxGroupTime`). Under continuous arrivals the
+pause never comes mid-stream: the first fully-lost group
+blocks everything behind it until the stream ends. At trickle
+the groups are k=1 (5 ms flush vs 10 ms spacing), so one
+dropped record is one fully-lost group — and observation 3
+guarantees those groups carry no parity. Packet mode
+inherits the stall by construction; nothing in UDP semantics
+asks for it.
+
+Treatments prototyped: **(A) delivery-semantics split** —
+packet mode delivers each group as it resolves (partial
+preservation, DESIGN.md 5.2), stream mode keeps the ordered
+cursor; the cursor degrades to an accounting role so gap
+synthesis still accounts each lost group exactly once;
+**(B) gap-timeout tuning** (150 → 50 / 25 ms); **(C) eager
+gap synthesis** (observation 3's treatment) as a mitigation.
+
+Trickle cell (100 msg/s, 5% loss), medians over 3 reps,
+identical for the no-FEC, fixed-step and estimator rows
+unless noted:
+
+| arm | delivery % | p50 | p95 | overhead % |
+|---|---|---|---|---|
+| ordered GT150 (production) | 94.33 | 1555 ms | 2905 ms | 0.83 |
+| **unordered (A)** | 94.33 | **14.7 ms** | **14.9 ms** | 0.83 |
+| ordered GT50 (B) | 94.33 | 1405 ms | 2755 ms | 0.83 |
+| ordered GT25 (B) | 95.0–96.0 | 1040–1468 ms | 2380–2839 ms | 9.6–23.4 |
+| eager (C), FEC engaged | 97.3–99.0 | 583–945 ms | 1010–1926 ms | 34.9–46.8 |
+
+Unordered delivery is a pure win in this rig: **p50 falls
+~100× (1555 → 14.7 ms) and p95 ~200×, at identical delivery
+and identical overhead** — the same messages are lost, they
+are just not waited on. Bulk spot cells (5/10/20%) show no
+regression (delivery within 0.2pt of ordered, overhead
+identical). Timeout tuning is rejected on measurement: the
+trigger is pause-based, so the value barely matters under
+continuous arrivals (GT50: −150 ms of 1555), and GT25 is
+*unstable across runs* (overhead 9.6% in one run, 23.4% in
+the next) — at this link's ~8.6 ms/record service time a
+group of k+r ≥ 3 records spans more than 25 ms on the wire,
+so GT25 resolves in-flight groups as lost, manufactures
+feedback loss, and the spend/expiry loop's gain varies run
+to run. (General form: GroupTimeout must exceed a group's
+wire span; that coupling is itself an argument against
+tuning as the lever.) Eager synthesis helps — its engaged
+rows recover delivery to 97.3–99.0% — but its latency stays
+dominated by parity-spend queueing (see observation 3), so
+it is a mitigation, not the fix, for this observation.
+
+**Verdict: adopt (as a recommendation to Emma) for the
+packet plane: make unordered delivery the packet-mode
+default** — it is DESIGN 5.2's partial preservation arriving
+via measurement. Two adoption prerequisites, both noted for
+the landing change, not prototyped here: the delivered-set
+map must become a bounded sliding window (the prototype's
+map grows with connection lifetime), and same-destination
+UDP flows will observe reordering around losses (legal for
+UDP, and the in-tree packet path processes each framed
+packet independently, but not re-verified against every
+sing-box packet consumer). **Stream mode:
+accept-and-document** — ordered delivery is semantically
+mandatory for a byte stream; the stall there is bounded by
+gap synthesis after pauses, and the structural answer is
+the QUIC milestone's stream/datagram split, not anything
+this layer can do.
+
+#### Observation 3 — feedback blindness at small group sizes
+
+Mechanism: the feedback accumulator is fed only by group
+resolution and by (post-pause) gap synthesis, so a
+fully-lost group is invisible while the stream runs; at
+trickle that is the dominant loss mode. The harness trace
+reproduces the flagged probe exactly: production shows 32
+feedback windows of which the first 31 are ratio 0.000, then
+one window at t=3.31 s with exp=16, lost=16, ratio 1.000,
+slamming redundancy to the 0.15 cap after the stream is
+over. A unit-level run pins the same shape: production
+mid-stream redundancy is exactly 0 throughout a 5%-loss
+trickle, and jumps to the cap only after a post-stream
+pause. The controllers are not at fault; the accounting
+shape starves any controller identically. (The harness-fix
+note's tail-window EWMA overshoot is this same shape seen
+from the other side.)
+
+Treatment prototyped: **eager gap synthesis** — on the
+ordered record carrier, a later group's first record is
+proof that an unseen earlier slot's records were dropped
+(they precede it in the stream), so the receiver declares
+the slot lost on that proof (plus an optional grace,
+`GapProofGrace`) instead of waiting for a pause. Receiver-
+local: no wire or format change. A chained-gap refinement
+(one expiry tick clears a whole run of consecutive gaps, not
+one gap per tick) was measured separately: it cut the
+no-FEC eager arm's p95 from 141 to 60 ms, and did not move
+the FEC-engaged arms — their latency is queueing, not
+synthesis (below).
+
+Trace with eager synthesis: first nonzero window at #3
+(t=0.41 s, ratio 0.091), 12–14 nonzero windows spread across
+the stream, redundancy tracking the losses as they happen
+(0.038–0.150) instead of arriving as one post-mortem spike.
+Consequences in the trickle cell: the controllers engage
+mid-stream and delivery rises 94.33 → 97.33% (fixed-step) /
+99.00% (estimator). Two costs, both measured and neither
+hidden:
+
+- **Small-group spend**: an engaged controller puts r=1 on
+  every k=1 group (`ParityFor(1, ρ) = 1`), ~100% parity per
+  protected group; trickle overhead lands at 34.9–46.8%.
+- **Spend queueing**: on the trickle link (18% headroom over
+  payload), engaged parity roughly doubles wire demand
+  (~1.9 vs 1.13 Mbps), so latency stays queue-dominated
+  (p50 583–945 ms) even though delivery is fixed. The
+  no-FEC eager arm (p50 14.7 ms) isolates the accounting
+  path itself as fast; the engaged arms' latency is the
+  spend, not the synthesis.
+
+Bulk cells show eager synthesis is behaviour-neutral where
+groups are large (delivery within 0.3pt of ordered at
+5/10/20%, mixed sign; overhead identical) — fully-lost
+groups barely exist there; what changes is only *when* the
+rare one is declared, which also cleans up the tail-window
+accounting.
+
+**Verdict: adopt (as a recommendation to Emma) the
+accounting change — eager gap synthesis on ordered
+carriers.** It fixes the signal every controller and every
+future cap/yield decision reads, at zero wire cost, and is
+bulk-neutral. **Deferred, as a required companion before
+FEC-on can be a default for interactive flows: a
+small-group spend policy** (batching toward k≥4 at low
+rates, or parity priced by group size). That is a separate
+design question — it trades latency (batching delay) for
+overhead on exactly the flows whose latency matters — and
+it has not been measured yet; eager synthesis plus today's
+spend policy at trickle trades 35–47% overhead for
++2.7–4.7pt delivery, which fails DESIGN 5.4's budget and
+should not ship as a default. Cumulative feedback (the
+carrier-independent form of this fix, needed where records
+can reorder) is designed but not prototyped: it belongs to
+the QUIC milestone's feedback design, with `GapProofGrace`
+as the bridge for datagram carriers. Sender-side loss
+inference was rejected on inspection: off-harness, the
+sender cannot distinguish a lost group from lost feedback.
+
+#### Regression gates for this work
+
+- `go vet` clean (`protocol/musess/fec`, `protocol/musess`,
+  `option`); full fec and musess unit tests pass, including
+  five new experiment tests (yield-clone fidelity,
+  loss-aware floor bounds, both blind-floor arms, unordered
+  endpoint delivery, eager feedback engagement).
+- FEC e2e (`test/run-e2e-fec.sh`): **6/6 with flags off and
+  6/6 with `MUSESS_FEC_EXP=uo,eager`** on the rebuilt binary.
+- Milestone-1 e2e (`test/run-e2e.sh`): **5 passed, 1 failed —
+  the established profile**; the failure is check (d), the
+  sandbox's unconnected-UDP EPERM at the final stock-socks
+  hop, with the same pre-existing stock `buffer overflow`
+  panic in that teardown.
+- Nothing in the production construction paths changed
+  defaults: `NewController`, the `Options` zero value, and
+  the musess `fec` option surface behave exactly as in
+  milestone 2 unless an experiment flag is explicitly set.
+
+#### Still open after this work
+
+- The real saturated-link test for observation 1's signal
+  question (queue depth vs wire saturation), and any WAN
+  validation of all three verdicts — every number above is
+  this sandbox's record shim, as before.
+- QUIC milestone inputs: partial-reliable delivery semantics
+  (observation 2's split is the TCP/UDP-plane preview),
+  cumulative feedback for reordering carriers and the
+  reordering window `GapProofGrace` must cover
+  (observation 3), and the small-group spend policy —
+  batching vs size-priced parity — which gates FEC-on for
+  interactive flows on any carrier.
+- Files: `protocol/musess/fec/experiment.go` (yield policy),
+  `experiment_test.go`, `exp_bench_test.go` (the three
+  `TestExp*` entry points), experiment fields and pumps in
+  `endpoint.go`, the `runTransferMod` split in
+  `bench_test.go` (nil modifier = the fixed harness,
+  unchanged), and the env-gated flag application in
+  `protocol/musess/fecwire.go`. Bench logs:
+  `.tmp/exp-obs/{yield,trickle,trickle2,uobulk}.log`.
+
 ## Overhead vs the ≤8% shaping budget (DESIGN.md 5.4)
 
 The 8% budget in the design text is written for shaping/padding
