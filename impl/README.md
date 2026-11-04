@@ -847,6 +847,220 @@ from this environment's compressed recovery; the cap
 re-evaluation should wait for the harness fix flagged
 above. No cap or production change was made here.
 
+### Harness fix and re-measurement (2026-11-05)
+
+The follow-up the re-run above called for. The harness
+(`protocol/musess/fec/bench_test.go`) was diagnosed
+forensically, fixed, and everything re-measured. Production
+FEC code was NOT changed; three production-behaviour
+observations are flagged at the end for design decisions.
+
+#### Diagnosis: why the three runs disagreed
+
+1. **The original table did not come from the committed
+   harness (proven, not inferred).** The no-FEC baseline's
+   drop count is fully determined by the harness's seeded
+   loss model: seed 1234 over 4000 records drops exactly
+   45/121/204/412/596 records at 1/3/5/10/15% loss. Every
+   re-run and supplement cell matches those counts exactly;
+   the original table's counts (39/118/199/398/604) match
+   none of them. Separately, the original goodput column is
+   impossible under the committed receive loop, which could
+   only exit a lossy cell via its 60 s drain timer — the
+   original rows imply ~2 s elapsed at every loss level.
+   The original absolutes must have been produced by a
+   pre-final development state of the harness; what state
+   exactly is not recoverable from surviving artifacts. The
+   original tables above stay as labelled history; their
+   absolute delivery/goodput figures are superseded by this
+   section and should not be quoted.
+2. **The re-run's recovery compression is fully
+   mechanised.** In the old synchronous shim, each record's
+   service time was a relative sleep; on this VM
+   `time.Sleep(411µs)` actually takes ~1.08 ms (500 sleeps:
+   541 ms vs 206 ms nominal), so the wire drained ~2.7×
+   slower than the pacer filled it. The FEC send queue sat
+   above the saturation threshold for most of each transfer,
+   and the production yield wrapper — behaving as written —
+   halved its factor per feedback window down to its 0.2
+   floor, pinning applied redundancy at ~2–3% (r=1 per
+   k=16 group) while feedback reported 11–14% loss
+   (instrumented trace at 10% loss: requested rho
+   0.140→0.150, applied 0.075→0.032→0.022; r=1 for 40 of 63
+   groups; delivery 92.80%, matching the binomial bound for
+   r=1 ≈ 91.8% and the re-run's observed 91.67%). Control
+   experiments on the same cell: with the yield signal
+   disabled, delivery 95.20% at 14.89% overhead; with a
+   static rho=0.129, 97.10% at 16.87%. So the original
+   pairing (99.15% delivery AND 7.15% overhead) fits no
+   regime of the committed code — sustained r=3 costs
+   ~15–17% overhead; r=1 caps delivery near 92%.
+3. The supplement's EWMA overshoot (~25.4% read at 20%
+   configured loss) is the same accounting shape as the
+   trickle probe below: the value was sampled after the
+   60 s drain, when the only feedback windows still moving
+   are tail windows enriched with gap-synthesis all-loss
+   accounting. Mid-transfer windows centre on the true
+   rate. The fixed harness reads controller state at
+   quiescence, not after a drain.
+4. Minor: the old receive loop spawned a reader goroutine
+   per message; at loop exit one message could be swallowed
+   uncounted.
+
+#### The fix (harness only)
+
+- Asynchronous shim: `Write` parses records, applies the
+  seeded loss model, and enqueues survivors; a forwarder
+  goroutine releases them in order on an absolute schedule
+  using timer waits (measured ~nominal on this VM, vs the
+  2.6× overshoot of relative sleeps).
+- The release queue is finite (512 records), modelling a
+  link buffer: backpressure propagates to the FEC send
+  queue as it would in a real stack. (An unbounded queue
+  silently stopped the saturation cells from saturating
+  anything; a busy-spin on a closed channel in the first
+  fix version was caught by its own smoke run and fixed.)
+- Completion is quiescence: sender done, both shims
+  drained, and the receiver's resolution accounting frozen
+  for 2 s. Elapsed (the goodput denominator) is the last
+  delivered message's arrival time; wall time is printed
+  alongside. Shim drop/forward counters are printed per
+  cell, so realised drops audit against the seeded
+  prediction (the no-FEC rows match exactly in every run
+  below; a ≤0.2pt tail-accounting tolerance remains on
+  individual cells, from tail groups resolved by expiry).
+- Rig parameters unchanged otherwise (4000×1200 B,
+  FeedbackInterval 100 ms in-harness vs the 200 ms
+  production default — pre-existing harness choice).
+
+#### Corrected results
+
+Repetitions — 10 reps, per-rep seeds shared across configs
+(paired), link at 43% headroom so the wire never saturates
+and the cap is the binding constraint. Medians (ranges):
+
+| config | loss | delivery % | goodput Mbps | overhead % |
+|---|---|---|---|---|
+| none | 5% | 95.01 (94.50–95.20) | 8.60 (7.48–8.85) | 0.83 |
+| none | 10% | 90.05 (89.38–90.60) | 8.37 (5.44–8.80) | 0.83 |
+| none | 15% | 85.06 (84.25–86.02) | 8.42 (5.45–8.83) | 0.83 |
+| none | 20% | 80.00 (79.00–80.77) | 8.33 (5.81–8.83) | 0.83 |
+| rs + fixed-step | 5% | 97.49 (97.22–97.95) | 8.06 (6.22–8.42) | 8.60 (7.32–8.88) |
+| rs + fixed-step | 10% | 92.93 (92.15–93.58) | 7.94 (6.15–8.28) | 9.34 (8.13–9.60) |
+| rs + fixed-step | 15% | 87.85 (86.67–88.98) | 7.89 (6.80–8.36) | 9.70 (8.41–9.85) |
+| rs + fixed-step | 20% | 81.99 (81.23–82.95) | 7.81 (5.21–8.20) | 10.21 (8.45–10.35) |
+| rs + estimator | 5% | 97.28 (97.05–97.50) | 8.40 (6.29–8.49) | 7.41 (6.73–8.12) |
+| rs + estimator | 10% | 93.11 (92.27–93.70) | 8.12 (7.18–8.39) | 9.06 (8.58–9.53) |
+| rs + estimator | 15% | 87.75 (87.08–89.08) | 8.01 (5.67–8.33) | 9.71 (9.49–9.83) |
+| rs + estimator | 20% | 82.24 (81.27–83.45) | 7.94 (6.77–8.28) | 10.23 (9.91–10.37) |
+
+Full matrix (single run, seed 1234, the historical 18%
+headroom link), delivery %: uniform — none 98.88/96.78/
+94.80/89.70/85.10 at 1/3/5/10/15%; xor pairs 99.2–99.4 /
+97.5/95.6–95.8/90.8–91.1/86.3; rs pairs 99.4–99.7/98.6/
+97.0–97.2/92.3–92.5/87.3–87.7. Burst (5%/10%): rs
+94.7–95.0/89.6–90.0, xor 94.4–94.5/89.2–89.3. Saturation
+(100 into 23 Mbps, 5% loss): with the yield wrapper,
+rs rows deliver 96.9% at ~5.9% overhead and 8.52 Mbps
+goodput; the no-yield control delivers 98.3% at
+9.5–11.9% overhead but only 7.75–7.99 Mbps — the yield
+rule trades ~1.4pt delivery for ~+0.6 Mbps goodput and
+half the overhead under saturation, which is its design
+purpose read on the goodput metric (the milestone-2
+"+3.1pt delivery" framing of the same rule was
+one-sided). Codec ranking RS > XOR > none holds in every
+regime measured.
+
+Trickle (100 msg/s, 5% loss): eventual delivery
+94.7–96.7%, but p50 latency ≈ 1.5 s for every config —
+see flagged observation 2 below. Its overhead/delivery
+split is regime-dependent (probe-verified): when the host
+batches messages into groups of k≥2, partial losses are
+visible to feedback and the estimator engages (22.78%
+overhead, 96.67% delivery in the matrix run); when groups
+stay k=1, observation 3 applies and no parity is sent at
+all (0.83% overhead, 94.67%).
+
+Cap experiment at 20% loss (3 reps; harness-side clones of
+the production estimator+yield with a parameterised cap —
+fidelity gate: clone@15% vs production@15% delivery
+medians within 0.05pt and overhead identical, so the
+clone is trusted):
+
+| config | uniform delivery % | uniform goodput | burst delivery % | overhead % (u/b) |
+|---|---|---|---|---|
+| cap 15% (production) | 82.17 (81.03–82.65) | 7.83 | 83.05 (80.95–83.53) | 10.24 / 10.14 |
+| cap 30% (clone) | 83.33 (83.28–83.58) | 7.78 | 83.40 (83.08–84.35) | 13.49 / 12.49 |
+
+Doubling the cap buys **+1.16pt delivery (uniform) /
++0.35pt (burst), no goodput gain** (medians −0.05/−0.38
+Mbps, inside jitter), for **+3.25/+2.35pt wire
+overhead**. The estimator's uncapped request at 20% loss
+still ends at 21.5–22.8% (uniform) / 25.5–34.2% (burst)
+in this rig, and the yield wrapper moderates the average
+applied spend well below either cap. Pricing recorded
+for the cap decision; no change made.
+
+#### Verdicts
+
+- **Codec: RS > XOR > none — confirmed** in all regimes,
+  consistent with every prior run.
+- **Controller: the estimator pick stands, on different
+  grounds than originally claimed.** Delivery is a
+  statistical tie: paired median differences (estimator −
+  fixed-step) are −0.22pt at 5% (fixed-step wins 9/10
+  pairs — it steps straight to 10% redundancy while the
+  estimator asks ~6.7%), +0.12 at 10%, 0.00 at 15%,
+  +0.35pt at 20% (estimator 7/10). But on goodput — the
+  first priority — the estimator's median is higher at
+  all four loss levels (+0.11/+0.16/+0.13/+0.13 Mbps,
+  winning 30 of 40 pairs), and it spends less overhead at
+  low loss (−0.87pt at 5%, in all 10 pairs). The original
+  delivery blowout (99.15% vs 98.3% at 10%) does not
+  reproduce and is withdrawn; the margin for the
+  estimator is real but small, and fixed-step remains a
+  legitimate simpler alternative within delivery noise.
+- **FEC's corrected edge** over no FEC in this rig:
+  +2.2 to +3.1pt delivery across 5–20% uniform loss at
+  ~7–10% applied overhead (yield-moderated). Absolutes
+  remain environment-bound (this rig completes every
+  config, FEC or not, at ~8–9 Mbps — receiver-processing
+  paced); deltas and rankings are the content. FEC
+  benefit on a real QUIC path or WAN is still unmeasured.
+
+#### Flagged production observations (no change made)
+
+1. **Yield-wrapper depth.** Under a sustained send-queue
+   backlog the factor halves per feedback window to its
+   0.2 floor (and recovers ×1.5/window), so adaptive
+   redundancy effectively disengages to ~1 parity per
+   group for as long as the queue stays full — regardless
+   of measured loss. That is the wrapper behaving as
+   written; whether DESIGN 5.2's saturation rule intends
+   disengagement this complete is a design question, to
+   settle with a real saturated-link test, not this rig.
+2. **Ordered-delivery head-of-line stall.** One fully-lost
+   group blocks delivery of everything behind it until
+   arrivals pause for >GroupTimeout (150 ms) and gap
+   synthesis advances the cursor. Quantified at trickle:
+   p50 ≈ 1.5 s at 100 msg/s with 5% loss, for FEC and
+   no-FEC alike. Bulk groups (k=16) make full-group loss
+   ~impossible at these rates, but the packet/UDP plane
+   with small groups is exposed — and real UDP semantics
+   would not stall. A design question for the QUIC
+   milestone.
+3. **Feedback blindness at small group sizes.** A
+   fully-lost group contributes nothing to any feedback
+   window until gap synthesis runs (post-pause); the loss
+   then lands as a single all-loss window (probe at
+   trickle: 31 consecutive ratio-0.000 windows during a
+   5%-loss stream, then one window of exp=16, lost=16,
+   ratio=1.000 after it ended, slamming both controllers
+   to the cap with nothing left to protect). Controllers
+   are blind to trickle loss mid-stream and see a loss
+   spike after pauses; any future interactive-traffic FEC
+   behaviour must reckon with this accounting shape.
+
 ## Overhead vs the ≤8% shaping budget (DESIGN.md 5.4)
 
 The 8% budget in the design text is written for shaping/padding
