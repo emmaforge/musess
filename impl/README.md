@@ -518,8 +518,11 @@ the sender's queue. **This is not kernel netem** (tc is not
 permitted in this sandbox); all figures are labelled
 measured-in-this-environment. Payload 4000 × 1200B messages,
 offered 20 Mbps, flush 5 ms (the production default) and
-feedback every 100 ms, one run per cell — variance across runs
-was not characterised, treat small deltas as noise.
+feedback every 100 ms, one run per cell in the tables
+immediately below. A 3× idle-machine repetition of the uniform
+matrix and of the e2e bench is reported in "Repetition re-run
+(idle machine, 3×)" further down; several absolutes from this
+single run did **not** reproduce there — read the two together.
 
 ### Uniform random loss — delivery % / goodput Mbps (overhead %)
 
@@ -608,6 +611,15 @@ the 10% burst row (delivery) — recorded here, not hidden. Both
 losers (XOR codec, fixed-step controller) remain in the package
 and in the harness for future replays.
 
+Repetition note (2026-11-05): in the 3× idle-machine re-run
+reported below, the codec half of this decision reproduced in
+every run (the RS pair sits above the XOR pair above the
+no-FEC baseline at every loss level, on delivery); the
+controller half did not separate — estimator and fixed-step
+were tied within ±0.27pt across all lossy RS cells. Treat
+"estimator > fixed-step" as unconfirmed and "RS > XOR" as
+confirmed; see "Repetition re-run (idle machine, 3×)".
+
 ## End-to-end benchmark (real binary, impairment shim)
 
 `test/bench-e2e.sh` (32 MiB bulk download per leg, this machine,
@@ -644,7 +656,11 @@ earlier run of this bench with a serialising (drain-then-delay)
 shim produced a "legs converge under delay" table; that shim
 behaviour was a fidelity bug, the table was superseded, and the
 convergence reading is **withdrawn**. These are first numbers
-in a constrained sandbox, not WAN results.
+in a constrained sandbox, not WAN results. A 3× idle-machine
+repetition of this bench is reported in "Repetition re-run
+(idle machine, 3×)" below: the delay-column ordering and the
+100 ms musess/SS2022 ratio reproduced (0.39, per-run
+0.38–0.40, against 0.41 here).
 
 FEC functional e2e: `test/run-e2e-fec.sh` — 6/6 checks pass:
 1 MiB byte-identical fetch over the negotiated FEC duplex (TCP
@@ -653,6 +669,183 @@ logs, UDP probe carried through the FEC packet plane to the echo
 server (full round trip still blocked at the final stock-socks
 hop by this sandbox's UDP policy, as in milestone 1), and clean
 fallback to plain framing when the server declines FEC.
+
+### Repetition re-run (idle machine, 3×)
+
+On 2026-11-05 the uniform-loss matrix and the e2e delay bench
+above were re-run 3 times each on this machine, strictly
+sequentially, with nothing else running (load average 1-min
+0.05–0.36 in the before/after readings for every reported
+run, after an initial settling period that saw readings up to
+~1.4 from session startup). Raw logs: `.tmp/rerun/fec-rerun{A,B,C}.log`
+and `.tmp/rerun/bench-e2e-run{1,2,3}.log`. One preliminary
+invocation was discarded as incomplete — it hit the default
+10-minute `go test` timeout after three cells. The three
+reported FEC runs used a 30-minute timeout and were stopped
+once the uniform section completed; the burst / saturation /
+latency tables above remain single-run.
+
+**The headline: the single-run absolutes above did not
+reproduce, and the failure sits in the harness's interaction
+with this environment, not in general machine slowness.**
+Cross-checks from the same period: the codec CPU benchmark
+reproduces (XOR encode 1468 MB/s vs 1451 above), single-core
+speed and CPU idle time are normal, and the real-binary delay
+bench (below) reproduces its absolutes. But in the
+record-shim harness:
+
+- at 0% loss, goodput is ≈8.8 Mbps of 20 offered in all three
+  runs (transfer elapsed ≈4.4 s against the 1.92 s offered
+  schedule). A ≈8.7–8.8 Mbps 0% figure had previously been
+  seen only in a run under heavy parallel load; here it
+  occurred at load ≤0.4, so load alone does not explain the
+  harness's sensitivity;
+- in every lossy cell the receive loop runs to the harness's
+  60 s drain (`drainUntil` in bench_test.go), so the printed
+  "goodput" is 0.54–0.64 Mbps for every config — it measures
+  the drain, not the link. The goodput column of the original
+  uniform table is therefore **not reproduced** and should
+  not be quoted until the harness's elapsed accounting is
+  revisited (a follow-up; no harness change was made during
+  this re-run);
+- recovered-shard counts collapse to the tens per cell (RS
+  rows at 10–15% loss: 60–95 recovered per run, against the
+  several hundred the original table's delivery figures
+  imply), and FEC's delivery advantage shrinks with them.
+
+What reproduced exactly: the no-FEC baseline's delivery at
+every loss level — identical in all 3 runs and within
+0.35pt of the original at every level. The loss floor of the
+model is stable; it is the recovery path that varies.
+
+Delivery % — median (range) over the 3 runs:
+
+| config | 0% | 1% | 3% | 5% | 10% | 15% |
+|---|---|---|---|---|---|---|
+| none (baseline) | 100 (100–100) | 98.88 (98.88–98.88) | 96.97 (96.97–96.97) | 94.90 (94.90–94.90) | 89.70 (89.70–89.70) | 85.10 (85.10–85.10) |
+| xor + fixed-step | 100 (100–100) | 99.40 (99.35–99.50) | 97.60 (97.55–97.65) | 95.62 (95.53–95.62) | 90.25 (90.25–90.38) | 85.28 (85.25–85.32) |
+| xor + estimator | 100 (100–100) | 99.28 (99.28–99.28) | 97.58 (97.47–97.58) | 95.28 (95.25–95.40) | 89.95 (89.95–90.00) | 85.20 (85.10–85.40) |
+| rs + fixed-step | 100 (100–100) | 99.67 (99.65–99.72) | 98.58 (98.58–98.70) | 96.97 (96.97–96.97) | 91.70 (91.70–91.88) | 86.28 (86.28–86.28) |
+| rs + estimator | 100 (100–100) | 99.45 (99.40–99.58) | 98.70 (98.58–98.70) | 96.97 (96.97–97.08) | 91.67 (91.67–91.90) | 86.28 (86.25–86.28) |
+
+Goodput Mbps — median (range): only the 0% column is a
+transfer measurement (medians 8.76–8.80 across configs,
+ranges ≤0.16 wide); every lossy cell sits at the drain
+artefact (0.54–0.64, ranges ≤0.02) and carries no information
+beyond the delivery column, so it is not tabulated per cell.
+Overhead % — median (range): the RS rows at ≥3% loss match
+the original closely (6.89–7.43 vs 5.34–8.00); at 1% both RS
+controllers ran hotter than the original (rs + estimator
+4.45 (3.81–4.64), rs + fixed-step 6.31 (6.26–6.31), vs 1.65 /
+2.67); XOR overhead was far lower than the original (medians
+1.98–4.70 across lossy cells vs 6.92–12.50), consistent with
+the reduced recovery activity in this environment.
+
+**Ranking verdict.** On delivery, the production ranking's
+codec level — RS pair > XOR pair > none — held at every loss
+level in all 3 runs, with a single boundary tie
+(xor + estimator = none at 15% in run A, 85.10 = 85.10;
+strictly above in runs B and C). The controller level —
+estimator > fixed-step — did **not** hold: across the 15
+lossy RS cells the estimator was ahead in 3, fixed-step in
+6, and 6 were tied, with no delta above 0.27pt; fixed-step
+was nominally ahead at 1% in all 3 runs. The absolute RS
+advantage is also far smaller here than in the single run
+(at 10%: 91.67–91.70 vs 98.32–99.15; at 15%: 86.28 vs
+96.47–98.45). Net: the RS half of the production decision is
+confirmed by repetition; the estimator half and the single
+run's goodput/delivery absolutes are not — they are
+environment-sensitive in a way this re-run exposes but does
+not explain (no mechanism diagnosed here).
+
+Delay bench — Mbps, median (range) over the 3 runs:
+
+| leg | none | delay 25 ms/dir | delay 100 ms/dir | delay 25 ms + holds (5% × 60 ms) |
+|---|---|---|---|---|
+| direct (cubic) | 33667.43 (26619.68–36207.98) | 4374.48 (4126.60–4848.26) | 2019.52 (2008.68–2065.14) | 2323.27 (2303.15–2374.16) |
+| shadowsocks-2022 (sing-box) | 4634.28 (3353.02–5890.49) | 1447.31 (1389.22–1836.59) | 1022.28 (1004.90–1038.18) | 1682.41 (1516.35–1729.47) |
+| musess (fec off) | 3839.93 (2665.92–6504.75) | 1308.86 (986.14–1318.33) | 406.72 (383.37–410.66) | 895.37 (840.96–966.07) |
+
+**The 0.41 observation: confirmed.** musess/SS2022 at
+100 ms/dir was 0.392 / 0.382 / 0.402 in the three runs
+(median 0.392), against 0.409 / 0.411 in the two original
+samples — five samples now span 0.38–0.41, a stable ≈0.4×
+relationship. musess's absolute reproduces almost exactly
+(383.37–410.66 vs 407.60 / 410.37 originally); SS2022 ran
+slightly faster here (1004.90–1038.18 vs 996.71 / 998.91),
+which accounts for the small ratio shift. The unimpaired
+column remains burst-dominated with wide ranges, as warned
+above. As with the original observation, no mechanism is
+diagnosed here — reproducibility only.
+
+#### 20% supplement (lossy direction, 3×)
+
+Emma's real lines run 0–20% loss, above this matrix's 15%
+ceiling, and the loss is directional: heavy on the
+foreign→China downlink, light on the reverse. The harness
+already models exactly that shape (loss on the forward
+record path, clean reverse), so these 20% cells are the
+lossy-direction figures. Method: the committed harness has
+no 20% cells, so they were run from a checksum-verified
+byte-identical copy of the fec package kept outside the
+tree (scratch only; no production or harness code changed),
+with the same parameters and seeds as the main matrix,
+3 runs each, idle and sequential. Logs:
+`.tmp/rerun/fec-supp{1,2,3}.log`.
+
+Uniform 20% — delivery % median (range), overhead % median:
+
+| config | delivery | overhead |
+|---|---|---|
+| none (baseline) | 80.58 (80.58–80.58) | 0.83 |
+| xor + estimator | 80.80 (80.75–80.80) | 4.74 |
+| rs + fixed-step | 80.97 (80.77–81.05) | 7.41 |
+| rs + estimator | 81.00 (81.00–81.05) | 7.43 |
+
+Gilbert burst 20% — delivery % median (range), overhead %
+median:
+
+| config | delivery | overhead |
+|---|---|---|
+| none (baseline) | 81.00 (81.00–81.00) | 0.83 |
+| rs + fixed-step | 83.00 (82.88–83.28) | 7.52 |
+| rs + estimator | 82.88 (82.73–82.93) | 7.39 |
+
+Goodput prints 0.52–0.53 Mbps in every supplement cell —
+the same 60 s drain artefact as the main re-run, not a link
+measurement. In this environment the FEC edge at 20% is
+small: +0.2 to +0.5pt over no FEC (uniform) and +1.9 to
++2.3pt (burst) — the same compressed recovery as the 0–15%
+re-run, not the original single run's margins. The
+estimator-vs-fixed-step ordering at 20% is again a coin
+flip (uniform: within 0.28pt; burst: fixed-step nominally
+ahead in 2 of 3 runs).
+
+**Estimator vs the 15% cap at 20% loss.** The rs+estimator
+cells were additionally instrumented (in the scratch copy
+only) to read the production estimator's final EWMA loss
+estimate after each run; its uncapped request follows by
+its own rule (1.25 × estimate + 0.4%, before the
+MaxRedundancy clamp):
+
+- uniform 20%: EWMA estimate 25.43% (25.02–25.96) →
+  uncapped request **32.19%** (31.67–32.85), ≈2.1× the cap;
+  the applied redundancy ended at the 15.00% cap in all
+  3 runs;
+- burst 20%: EWMA estimate 16.20% (11.71–17.59 — the
+  end-of-run snapshot is noisier under a Gilbert process) →
+  uncapped request **20.65%** (15.04–22.39); applied again
+  15.00% in all 3 runs.
+
+So at 20% loss the estimator presses against the cap
+essentially continuously in both loss models — the cap,
+not the estimator, decides how much redundancy is sent.
+(The uniform-loss estimate settling ~5pt above the
+configured 20% drop rate is recorded, not explained.) What
+raising the cap would buy in delivery cannot be answered
+from this environment's compressed recovery; the cap
+re-evaluation should wait for the harness fix flagged
+above. No cap or production change was made here.
 
 ## Overhead vs the ≤8% shaping budget (DESIGN.md 5.4)
 
