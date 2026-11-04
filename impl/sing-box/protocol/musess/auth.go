@@ -1,9 +1,12 @@
 package musess
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/hkdf"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -149,6 +152,80 @@ func ServerProof(proofKey, exporter []byte) []byte {
 func (a *ClientSessionAuth) VerifyServerProof(proof, exporter []byte) bool {
 	expected := ServerProof(a.proofKey, exporter)
 	return subtle.ConstantTimeCompare(proof, expected) == 1
+}
+
+// --- Early (pipelined) request sealing -------------------------------------
+//
+// Rate-attack phase 1 diagnosed the stock flow's connection-setup
+// cost: it serialises two application flights after the TLS
+// handshake (server proof -> client request), each costing a full
+// leg RTT before the first data byte can flow. With early_request
+// enabled on both peers the client instead sends its request header
+// immediately after the handshake, AEAD-sealed under a key derived
+// from the session proof key, and verifies the server proof when it
+// arrives (the proof still precedes any relayed data in the
+// server->client stream, so the client never consumes data from an
+// unproven server). Sealing keeps the request's destination
+// confidential even if the TLS session were terminated by an
+// impostor: without the musess session keys the header is opaque.
+// Wire form:
+//
+//	[0x00][2-byte big-endian length][12-byte nonce][AES-256-GCM ct]
+//
+// The leading 0x00 is not a valid framing version, so a server with
+// early_request enabled can auto-detect sealed vs plain requests;
+// a server without it rejects the stream exactly like any other
+// malformed header (post-authentication path only).
+
+const sealedRequestMarker = 0x00
+
+func deriveRequestKey(proofKey []byte) ([]byte, error) {
+	return hkdf.Key(sha256.New, proofKey, nil, "musess early request key", 32)
+}
+
+func sealRequest(proofKey, header []byte) ([]byte, error) {
+	key, err := deriveRequestKey(proofKey)
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err = rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	body := make([]byte, 0, len(nonce)+len(header)+gcm.Overhead())
+	body = append(body, nonce...)
+	body = gcm.Seal(body, nonce, header, nil)
+	out := make([]byte, 0, 3+len(body))
+	out = append(out, sealedRequestMarker)
+	var length [2]byte
+	binary.BigEndian.PutUint16(length[:], uint16(len(body)))
+	out = append(out, length[:]...)
+	out = append(out, body...)
+	return out, nil
+}
+
+func openSealedRequest(proofKey, body []byte) ([]byte, error) {
+	key, err := deriveRequestKey(proofKey)
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if len(body) < gcm.NonceSize() {
+		return nil, errors.New("musess: sealed request too short")
+	}
+	return gcm.Open(nil, body[:gcm.NonceSize()], body[gcm.NonceSize():], nil)
 }
 
 // replayCache remembers accepted session IDs until their window ends.

@@ -1,6 +1,7 @@
 package musess
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -63,6 +64,49 @@ func writeRequestV2(w io.Writer, command byte, destination M.Socksaddr, flags by
 	}
 	_, err = w.Write(header.Bytes())
 	return err
+}
+
+// buildRequestHeader renders a request header into memory: v2 with
+// flags when fecEnabled, v1 otherwise (mirrors the on-wire writers).
+func buildRequestHeader(fecEnabled bool, command byte, destination M.Socksaddr, flags byte) ([]byte, error) {
+	var buffer bytes.Buffer
+	var err error
+	if fecEnabled {
+		err = writeRequestV2(&buffer, command, destination, flags)
+	} else {
+		err = writeRequest(&buffer, command, destination)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return buffer.Bytes(), nil
+}
+
+// readRequestAuto reads a request header that may be plain (first
+// byte is a framing version) or sealed (first byte is
+// sealedRequestMarker; see auth.go). It lets an early_request server
+// keep accepting plain clients.
+func readRequestAuto(r io.Reader, proofKey []byte) (version byte, command byte, flags byte, destination M.Socksaddr, err error) {
+	var first [1]byte
+	if _, err = io.ReadFull(r, first[:]); err != nil {
+		return 0, 0, 0, M.Socksaddr{}, err
+	}
+	if first[0] != sealedRequestMarker {
+		return readRequest(io.MultiReader(bytes.NewReader(first[:]), r))
+	}
+	var lengthBytes [2]byte
+	if _, err = io.ReadFull(r, lengthBytes[:]); err != nil {
+		return 0, 0, 0, M.Socksaddr{}, err
+	}
+	body := make([]byte, int(binary.BigEndian.Uint16(lengthBytes[:])))
+	if _, err = io.ReadFull(r, body); err != nil {
+		return 0, 0, 0, M.Socksaddr{}, err
+	}
+	header, err := openSealedRequest(proofKey, body)
+	if err != nil {
+		return 0, 0, 0, M.Socksaddr{}, err
+	}
+	return readRequest(bytes.NewReader(header))
 }
 
 // readRequest parses a v1 or v2 request header. It returns the

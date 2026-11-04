@@ -983,3 +983,402 @@ In `test/`:
   pair.
 - `helper/main.go` — `shim` (delay/hold impairment),
   `bulkserver`, `bulkclient` modes.
+
+
+---
+
+# musess — rate attack, phase 1 (2026-11-05)
+
+Emma's directive: if the rate is not good, find out why, test
+candidates head-to-head, combine winners, and invent a new
+high-rate approach if the structure is the ceiling. Selection stays
+measurement-based; priority 速率 > 伪装 > 延迟. Phase 1 =
+diagnosis + individual screens. **No production code was changed
+by phase 1**: the prototype lives in `impl/.tmp/exp-tree/` (a copy
+of the tree) and the lab scripts in `impl/.tmp/rate-lab/`; the
+production tree's only working-copy changes belong to the parallel
+FEC task.
+
+## Target fact (reproduced)
+
+On `test/bench-e2e.sh` (32 MiB, user-space delay/hold shim — a
+latency model, NOT packet loss, NOT netem), musess (TCP, FEC off)
+falls behind Shadowsocks-2022 as delay grows: at 100 ms/dir,
+musess ≈ 390–400 Mbps vs SS2022 ≈ 1000 Mbps in a fast window
+(ratio ≈ 0.39; re-verified 2026-11-05: 398 vs 1014).
+
+Environment honesty: sandbox, loopback, cubic only (no BBR), 4
+cores shared with a parallel task. Absolute sandbox Mbps move
+with machine state — SS2022's own delay100 figure ranged
+555–1056 Mbps across windows on the same day — so the load-bearing
+quantities below are the load-insensitive ones: time-to-first-byte
+(TTFB, the musess leg is setup-bound and its times repeat to the
+millisecond) and within-window medians of total time.
+
+## Diagnosis
+
+**Experiment 1 — delivery profile** (progress-reporting bulk
+client, 256 MiB, delay100): musess delivers its first byte at
+t ≈ 0.61 s, then flows at rates comparable to SS2022; SS2022's
+first byte arrives at t ≈ 0.24 s. The deficit is concentrated
+*before* the data flows, not in the flow.
+
+**Experiment 2 — steady state** (1 GiB, delay100, 3 runs each):
+musess 2632 / 2780 / 2503 Mbps vs SS2022 2378 / 2689 / 2438 Mbps —
+statistical parity. There is **no steady-state throughput
+deficit**, so the chained-TCP window/buffer-meltdown hypothesis
+is rejected by measurement: with `tcp_wmem` capped at 4 MiB both
+protocols sustain ~2.5 Gbps through the same shim, and the direct
+leg through the same shim reaches ~2.0 Gbps at delay100.
+
+**Root cause — connection-setup flight serialisation.** Counting
+one-way flights through the impaired leg (delay d each):
+
+| step | stock musess | SS2022 |
+|---|---|---|
+| handshake flight 1 (ClientHello / SS header+request) | d | d |
+| handshake flight 2 (server flight / first relayed data) | d | d |
+| client Finished (Go's std `tls.Server` handshake returns only after reading it) | d | — |
+| server proof flight (inbound writes proof, *then* reads the request) | d | — |
+| request flight (outbound reads proof, *then* writes the request) | d | — |
+| first relayed data flight | d | — |
+| **TTFB at d = 100 ms (model)** | **0.60 s** | **0.20 s** |
+| **TTFB measured (1 MiB, median of 3)** | **0.611 s** | **0.241 s** |
+
+The code serialises the last two flights by construction
+(`inbound.go`: `HandshakeContext` → `Write(ServerProof)` →
+`readRequest`; `outbound.go`: read proof → verify → `writeRequest`).
+At the bench's 32 MiB the transfer is almost entirely setup:
+0.61 s of setup + ~0.08 s of flow reproduces the stock bench
+totals (0.68–0.71 s) and hence the ≈0.39 ratio. On a real WAN path
+the same arithmetic applies with RTT/2 per flight: musess pays
+~3 RTT before first byte, SS2022 ~1 RTT. (The milestone-1 stock
+copy-stack buffer-overflow panic in a UDP teardown was not
+reproduced in phase 1 and has no evidenced link to this gap.)
+
+## Candidate screen: early request (pipelined, sealed)
+
+Design: with the new both-peers option `early_request`, the client
+sends its request header **with** its handshake-completing flight
+instead of after the proof flight — AEAD-sealed (AES-256-GCM)
+under a key HKDF-derived from the session proof key, wire form
+`[0x00][len][nonce][ct]` inside the TLS stream. The server reads
+the request before writing its proof; the proof still precedes any
+relayed data, so the client never consumes data from an unproven
+server, and sealing keeps the destination confidential even from
+a TLS-terminating impostor (without the musess session keys the
+header is opaque). Authenticated path only; pre-handshake wire
+shape and the unauthenticated fallback are byte-identical to
+stock. Flight count: 6 → 4.
+
+Measured (same bench, medians of 3 interleaved reps; seconds are
+primary, Mbps = 32 MiB / median seconds):
+
+| tier | stock musess | early-request | SS2022 (same windows) |
+|---|---|---|---|
+| TTFB proxy, delay100 (1 MiB total time) | 0.611 s | **0.411 s** | 0.241 s |
+| none, 32 MiB | 0.114 s / 2355 | 0.103 s / 2607 | noisy, burst regime |
+| delay25, 32 MiB | 0.310 s / 866 | **0.225 s / 1193** | 0.208–0.320 s |
+| delay100, 32 MiB | 0.688 s / 390 | **0.520 s / 516** | 0.305–0.484 s (load-varying) |
+| delay25+hold, 32 MiB | 0.279 s / 962 | 0.272 s / 987 | ≈ parity tier |
+
+The TTFB saving is 0.200 s at d = 100 ms — exactly the two
+serialised flights removed, as the model predicts; in the first
+clean window the delay100 ratio vs SS2022 moved 0.39 → 0.62
+(544 vs 881). At the hold tier the gain washes out (stalls
+dominate). Regression: milestone-1 e2e on the experiment binary
+shows the identical 5-pass / 1-fail profile with the option OFF
+**and** ON (the one failure is the pre-existing sandbox
+unconnected-UDP EPERM, unrelated); `go vet` clean; musess unit
+tests pass.
+
+Residual gap: TTFB 0.41 vs SS2022's 0.24 s is the price of having
+a real TLS handshake plus an exporter-bound server proof at all —
+SS2022 has no handshake. Removing more flights crosses decided
+red lines (see disqualified list).
+
+## Other candidates
+
+- **Server early proof** (send proof with the server's handshake
+  flight, e.g. via a uTLS server): screened out analytically —
+  the validated flight model shows the critical path runs through
+  the *request's* arrival at the server, so this cannot beat the
+  early-request 4 flights; not prototyped.
+- **Buffer/window/copy-path tuning**: screened out by Experiment
+  2 — steady state is already at parity; there is nothing for
+  tuning to recover.
+- **Multi-connection striping**: does not reduce setup wall-clock
+  (setups overlap, TTFB unchanged) and steady state needs no
+  help. Not shortlisted for this gap.
+- **Packet-up style framing**: orthogonal (upload chunking /
+  CDN-shaped paths); no effect on this bottleneck. Not
+  shortlisted here.
+- **First-flight request** (request bytes in or beside the
+  ClientHello flight; model TTFB ≈ 0.2 s): **DISQUALIFIED** —
+  extra non-ClientHello bytes in the client's first flight are a
+  fingerprint surface real Chrome never produces; violates the
+  camouflage / single-stack red line.
+- **0-RTT carrying the request**: **DISQUALIFIED** by Emma's
+  standing decision #4 (0-RTT for authentication data disabled).
+- **Multiplexing / persistent-connection reuse**: not prototyped
+  in phase 1, but the motivation is quantified — 10 sequential
+  1 MiB transfers at delay100 take **6.50 s stock / 4.47 s
+  early-request**, because every flow repays full TTFB; a muxed
+  musess connection would pay setup once (≈1 s total by the same
+  model). For many-small-flow workloads (web browsing) this
+  dwarfs the bulk-bench effect.
+
+## Shortlist for the combination round
+
+1. **early-request** (proven above; keep behind its option,
+   default off, until adopted) — combines with everything.
+2. **multiplexed stream framing** on one musess connection
+   (amortises setup across flows) — prototype next; measure
+   TTFB-per-stream and the sequential-small-flow total.
+3. Combined: early-request × mux, re-run the delay bench +
+   sequential-small-flow test; also re-check FEC negotiation
+   with early-request on (code-consistent, not yet benched).
+
+## What remains unverified
+
+- Everything WAN: real RTT/loss/middleboxes, BBR (unavailable in
+  this sandbox), paths where the target is not loopback-local.
+- FEC-on × early-request: functionally code-consistent (v2
+  header sealed the same way; status byte after proof) but the
+  FEC e2e was not re-run with `early_request` enabled.
+- Hold-model behaviour under real loss (the shim never drops);
+  the delay25+hold tier showed no measurable early-request gain.
+- Whether the gateway's larger lesson — setup cost dominates
+  short flows — shifts design priorities for the QUIC path
+  (where 0-RTT transport resumption is allowed for non-auth
+  data): noted for the QUIC milestone, not decided here.
+
+# musess — rate attack, phase 2 (2026-11-05)
+
+Phase 2 = land the proven fix, prototype the mux, bench the
+combination. Same bench discipline as phase 1: user-space
+delay/hold shim (latency model, NOT packet loss, NOT netem),
+interleaved repetitions (3 per cell, config order rotated per
+rep), medians reported with raw values, load gate before every
+boot (1-minute load < 2.5 on this 4-core sandbox shared with a
+parallel task; observed medians 1.4–1.9). Scripts:
+`impl/.tmp/rate-lab/bench-p2.sh` + `bench-p2-drive.sh`, raw
+results in `impl/.tmp/rate-lab/p2-results.txt`.
+
+## 1. early_request landed in the production tree
+
+The phase-1 experiment diff (5 files: `option/musess.go`,
+`protocol/musess/auth.go`, `framing.go`, `inbound.go`,
+`outbound.go`) was ported into `impl/sing-box` code-identically
+(verified: non-comment diff vs the experiment tree is empty),
+plus one new unit-test file (`early_request_test.go`, 6 tests:
+sealed round-trip for v1 and v2 headers, tampered ciphertext /
+nonce / tag / wrong-key rejection, plain-header passthrough for
+mixed peers, stock reader rejecting a sealed header, stream
+boundary and nonce randomness). Still behind the
+`early_request` option, default off.
+
+**One deliberate deviation from the experiment, forced by a
+test the brief required.** The experiment's server read the
+request *before* writing its proof. Exercising the asymmetric
+peer combinations end-to-end showed that a server with the
+option on and a stock client **deadlocks**: the stock client
+waits for the proof before sending anything, the experiment
+server waits for the request before proving (server log: the
+authenticated connection sat in the request read for 41 s until
+the client gave up). The landed server keeps the *stock order* —
+proof first, then `readRequestAuto`. The flight saving is the
+client's pipelining, not the server's order (phase 1's own model
+says the critical path runs through the request's arrival), and
+the combination bench below confirms the saving survives intact
+(TTFB 0.611 → 0.410 s, matching phase 1's 0.611 → 0.411). With
+proof-first, a server-side enable is safe for **any** client:
+stock clients get the byte-identical stock exchange plus a
+server that can also parse sealed headers. The remaining
+asymmetry is inherent and fails cleanly: an early client against
+a server with the option off is rejected post-authentication
+exactly like a malformed header (server log: "unsupported
+framing version") — never forwarded, never mistaken for an
+unauthenticated connection (authentication precedes the header).
+
+Regression evidence (production binary
+`1.14.0-alpha.2-musess-p2`):
+
+- `go vet` clean (`option`, `protocol/musess/...`); full musess
+  package tests pass, including the fec subpackage.
+- Milestone-1 e2e (`test/run-e2e.sh`): **identical 5-pass /
+  1-fail profile with early_request off, on, and server-only**
+  (the one failure is the pre-existing sandbox unconnected-UDP
+  EPERM, unrelated). Client-only fails check (a) by design, as
+  analysed above; fallback checks (b1/b2/c) pass in every
+  combination — the unauthenticated path is untouched.
+- FEC e2e (`test/run-e2e-fec.sh`) with `early_request` enabled
+  on both peers (variant script
+  `impl/.tmp/rate-lab/run-e2e-fec-p2-er.sh`): **6/6 pass**,
+  identical to early-off on the same binary — the sealed v2
+  header, the proof and the FEC status byte compose.
+
+## 2. Mux prototype (experiment tree only)
+
+Implemented in `.tmp/exp-tree` (re-synced from the landed
+production tree, then extended), behind a new off-by-default
+`mux` option on both peers. Design in brief
+(`protocol/musess/mux.go` there):
+
+- A musess connection opened with the new command `0x03`
+  becomes a stream session; the request destination is a
+  placeholder, each stream carries its own. Frames:
+  `[streamID u32][type u8][length u32][payload]`; open carries
+  `[command][SOCKS address]`, data is chunked at 32 KiB, plus
+  close (write-close) and reset frames. Only the client opens
+  streams (odd IDs); TCP only — a UDP open is reset.
+- The outbound keeps one lazily dialed session per process
+  (handshake + proof exactly as the plain path, early_request
+  included when enabled), redialed after death with one retry;
+  the inbound routes each stream independently through the
+  normal router.
+- Unit tests (`mux_test.go`, also run under `-race`, clean):
+  echo round-trip, 5 sequential streams on one session, 3
+  concurrent streams with distinct 70–130 KB payloads, reset of
+  an unsupported (UDP) open, session death failing open streams.
+
+Stated prototype limitations (not discovered later, chosen):
+no per-stream flow-control window — a full stream inbox (64
+chunks) backpressures the session reader, coupling streams
+head-of-line; **FEC is not composed with mux** (mux sessions run
+over the plain TLS stream regardless of the fec option); stream
+deadlines are no-ops; one session per outbound (no pooling).
+
+## 3. Combination bench
+
+Workloads: **ttfb** = a single 1 MiB transfer (setup-dominated);
+**bulk32 / bulk256** = single 32 / 256 MiB transfers; **seq10**
+= 10 sequential 1 MiB transfers against one long-lived client
+process, wall-clock. For mux configs the session is established
+by the ttfb workload and stays warm for the rest of the boot; a
+separate cold variant ran seq10 first on a fresh boot
+(`bench-p2-seqfirst.sh`). Seconds are primary; Mbps =
+size / median seconds. SS2022 legs use the milestone-2 configs.
+
+Delay 100 ms/dir, medians of 3 (raw values in the results file):
+
+| workload | stock | early | mux | combo | SS2022 |
+|---|---|---|---|---|---|
+| ttfb | 0.611 | **0.410** | 0.616 | 0.613 | 0.205 |
+| bulk32 | 0.667 | 0.457 | **0.432** | 0.460 | 0.271 |
+| bulk256 | 1.277 | **1.067** | 1.179 | 1.200 | 1.001 |
+| seq10 (warm session) | 6.279 | 4.299 | **2.727** | 3.411 | 2.150 |
+| seq10 (cold session) | — | — | 3.547 | 3.196 | — |
+
+Delay 25 ms/dir, medians of 3:
+
+| workload | stock | early | mux | combo | SS2022 |
+|---|---|---|---|---|---|
+| ttfb | 0.159 | **0.109** | 0.166 | 0.162 | 0.056 |
+| bulk32 | 0.220 | **0.159** | 0.213 | 0.253 | 0.118 |
+| bulk256 | 0.890 | **0.798** | 1.069 | 1.072 | 0.893 |
+| seq10 | 1.776 | 1.235 | 1.771 | 1.393 | 0.651 |
+
+Readings, each tied to the numbers above:
+
+- **Early-request reproduces on the production binary**, with
+  the proof-order fix: ttfb −0.201 s at delay100 and −0.050 s at
+  delay25 — exactly the two flights of the phase-1 model, at
+  both delays. bulk32 delay100 improves 0.667 → 0.457 (Mbps
+  ratio vs SS2022 0.69 of SS's time; phase 1 measured the same
+  effect in a dirtier window). At bulk256 the gap to SS nearly
+  closes (1.067 vs 1.001), consistent with phase 1's
+  steady-state parity.
+- **Mux's first flow gains nothing, by construction**: a mux
+  session's setup is the stock musess setup, and the first
+  stream's data cannot return until its OPEN frame has crossed
+  the leg (one round trip). Combo proves the decomposition: the
+  client log timestamps the (early) session establishment at
+  406 ms — the saving is real — yet ttfb lands at 0.613,
+  because the stream-open round trip costs back the 0.2 s the
+  session setup saved. From the second flow on, the win is
+  real: seq10 delay100 falls 6.279 (stock) → 4.299 (early) →
+  **2.727 warm / 3.547 cold (mux)**. Per-flow residual after
+  setup is ~0.21–0.29 s at delay100 for every config — a
+  transfer/ramp floor through the delay shim (SS2022's seq10,
+  2.150, sits at ~0.215/flow of almost pure setup), not
+  something either candidate removes.
+- **Combo adds nothing measurable over mux for streams** —
+  expected, since after session establishment the two data
+  planes are byte-identical by construction; their seq10
+  difference (3.411 vs 2.727 warm) is inside the observed
+  spread (combo raw 2.589–4.093) and is not read as an effect.
+  Combo's only real edge over mux is a faster *session*
+  establishment, which matters when sessions are short-lived.
+- **Mux taxes bulk**: bulk256 at delay25 is 1.069 (mux) vs
+  0.890 (stock) / 0.798 (early); at delay100, 1.179 vs 1.067
+  (early). A consistent ~10–20% at 256 MiB, growing with size
+  — consistent with per-frame demux cost in the prototype
+  (32 KiB frames, one reader goroutine); not profiled further
+  this phase. At 32 MiB the warm session's skipped setup hides
+  the tax (0.432, best musess at delay100).
+
+## 4. Defaults recommendation (priority 速率 > 伪装 > 延迟)
+
+**early_request: default ON, both peers.** The gain is the
+largest measured setup improvement available (ttfb −33% and
+seq10 −32% at delay100; −31% ttfb at delay25) and it costs
+nothing measured anywhere else: pre-handshake wire bytes and
+the unauthenticated fallback are byte-identical (milestone-1
+e2e b/c checks pass in every combination), the sealed header
+replaces the stock header flight inside the TLS stream — if
+anything it removes one application flight from the setup's
+shape — and the proof still gates all relayed data. Server-side
+default-on is safe unconditionally (proof-first order makes the
+server accept stock clients unchanged, verified). Client-side
+default-on is safe in the only ecosystem that exists: musess is
+pre-release with no deployed legacy base, and a client enabled
+against a server that has the option *manually disabled* fails
+cleanly and visibly (post-auth close), never silently. Rollout
+rule to document with the flip: servers first (they accept
+everyone), then clients. Implementation note: the option is a
+plain bool today, so default-on needs a tri-state (e.g.
+`badoption.Bool`) to keep an explicit `false` meaningful; that
+schema change is the follow-up commit, not done in this phase
+(the landing brief specified default-off for now).
+
+**mux: ship as an opt-in option, default OFF.** The seq10 win
+is the biggest single-workload improvement measured in both
+phases (−44% cold / −57% warm vs stock at delay100), and for
+browsing-shaped traffic it is the only structural answer. But
+default-on would contradict the priority order today: it taxes
+bulk throughput ~10–20% (速率 is first), it ships without
+per-stream flow control (head-of-line coupling between streams
+is unmeasured under mixed concurrent load), it does not compose
+with FEC yet, and its camouflage balance is genuinely two-sided
+— multiplexing itself is browser-normal (HTTP/2, HTTP/3), but
+concentrating all of a user's traffic into one long-lived,
+high-volume connection to a borrowed destination is a different
+shape from the many short connections that destination normally
+sees, and the mux frame/record pattern has not been compared
+against browser H2 record shapes. Opt-in for browsing-heavy
+deployments now; revisit the default after flow control, FEC
+composition, and a record-shape comparison exist.
+
+**combo**: no separate decision — where mux is enabled,
+early_request should be enabled with it (it only accelerates
+the session's own establishment).
+
+## What remains unverified
+
+- Everything WAN, as in phase 1 (real RTT/loss/middleboxes,
+  BBR, non-loopback targets); all phase-2 numbers are sandbox
+  loopback through the delay shim.
+- Mux under concurrent mixed load (many simultaneous streams,
+  mixed sizes): the head-of-line coupling is designed-in and
+  unit-tested for correctness, but no throughput/fairness
+  numbers exist yet.
+- Mux frame/record shape vs real browser H2 record patterns
+  (camouflage comparison not attempted).
+- The mux bulk tax mechanism (per-frame demux cost is the
+  consistent explanation; no profiling run was done).
+- FEC × mux composition (explicitly out of prototype scope).
+- The estimator-vs-step FEC controller question (parallel
+  task's re-run left it unconfirmed) is untouched by phase 2;
+  early_request composes with the *negotiated* FEC path as
+  proven by the FEC e2e, independent of controller choice.

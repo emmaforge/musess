@@ -29,6 +29,17 @@ type MusessInboundOptions struct {
 	// "on" is adaptive with a redundancy floor. FEC is used only
 	// when both peers enable it.
 	FEC string `json:"fec,omitempty"`
+	// EarlyRequest (rate-attack phase 2, landed from the phase-1
+	// experiment): the client pipelines its request header -
+	// AEAD-sealed under a key derived from the session proof key -
+	// immediately after the TLS handshake, instead of waiting one
+	// flight for the server proof first, saving one leg RTT of
+	// connection-setup latency. Authenticated path only; the
+	// unauthenticated fallback is untouched. On the server side
+	// enabling it is safe with any client (the proof keeps the
+	// stock order and plain requests are still accepted); a
+	// client must only enable it when the server does.
+	EarlyRequest bool `json:"early_request,omitempty"`
 }
 
 type MusessUser struct {
@@ -51,4 +62,7 @@ type MusessOutboundOptions struct {
 	// when set to "auto" or "on"; the server may decline, in which
 	// case the connection runs without it.
 	FEC string `json:"fec,omitempty"`
+	// EarlyRequest: see MusessInboundOptions.EarlyRequest. Enable
+	// only when the server enables it too.
+	EarlyRequest bool `json:"early_request,omitempty"`
 }

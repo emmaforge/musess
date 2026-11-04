@@ -36,6 +36,7 @@ type Outbound struct {
 	uuid         string
 	secret       string
 	fecMode      fecMode
+	earlyRequest bool
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MusessOutboundOptions) (adapter.Outbound, error) {
@@ -65,6 +66,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		uuid:         options.UUID,
 		secret:       options.Secret,
 		fecMode:      mode,
+		earlyRequest: options.EarlyRequest,
 	}, nil
 }
 
@@ -132,6 +134,27 @@ func (h *Outbound) dialStream(ctx context.Context, command byte, destination M.S
 		tlsConn.Close()
 		return nil, false, E.Cause(err, "musess: export keying material")
 	}
+	if h.earlyRequest {
+		// Pipeline the request header - sealed under the session
+		// request key - immediately after the handshake instead of
+		// spending one leg flight waiting for the server proof
+		// first. The proof is still verified below, before any
+		// relayed data is consumed.
+		header, err := buildRequestHeader(h.fecMode.enabled(), command, destination, fecFlagForward|fecFlagReverse)
+		if err != nil {
+			tlsConn.Close()
+			return nil, false, err
+		}
+		sealed, err := sealRequest(sessionAuth.proofKey, header)
+		if err != nil {
+			tlsConn.Close()
+			return nil, false, err
+		}
+		if _, err = tlsConn.Write(sealed); err != nil {
+			tlsConn.Close()
+			return nil, false, err
+		}
+	}
 	proof := make([]byte, serverProofLength)
 	if _, err = io.ReadFull(tlsConn, proof); err != nil {
 		tlsConn.Close()
@@ -142,16 +165,20 @@ func (h *Outbound) dialStream(ctx context.Context, command byte, destination M.S
 		return nil, false, E.New("musess: server proof mismatch (wrong server key or secret?)")
 	}
 	if !h.fecMode.enabled() {
-		// Milestone-1 wire behaviour, unchanged.
-		if err = writeRequest(tlsConn, command, destination); err != nil {
-			tlsConn.Close()
-			return nil, false, err
+		if !h.earlyRequest {
+			// Milestone-1 wire behaviour, unchanged.
+			if err = writeRequest(tlsConn, command, destination); err != nil {
+				tlsConn.Close()
+				return nil, false, err
+			}
 		}
 		return tlsConn, false, nil
 	}
-	if err = writeRequestV2(tlsConn, command, destination, fecFlagForward|fecFlagReverse); err != nil {
-		tlsConn.Close()
-		return nil, false, err
+	if !h.earlyRequest {
+		if err = writeRequestV2(tlsConn, command, destination, fecFlagForward|fecFlagReverse); err != nil {
+			tlsConn.Close()
+			return nil, false, err
+		}
 	}
 	var status [1]byte
 	if _, err = io.ReadFull(tlsConn, status[:]); err != nil {

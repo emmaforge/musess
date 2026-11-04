@@ -40,6 +40,7 @@ type Inbound struct {
 	users        []userEntry
 	replay       *replayCache
 	fecMode      fecMode
+	earlyRequest bool
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MusessInboundOptions) (adapter.Inbound, error) {
@@ -80,6 +81,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		certificate:  certificate,
 		replay:       newReplayCache(),
 		fecMode:      mode,
+		earlyRequest: options.EarlyRequest,
 	}
 	for _, user := range options.Users {
 		inbound.users = append(inbound.users, makeUserEntry(user.Name, user.UUID, user.Secret))
@@ -187,15 +189,41 @@ func (h *Inbound) serveAuthenticated(ctx context.Context, conn net.Conn, reader 
 		conn.Close()
 		return
 	}
+	var version, command, flags byte
+	var destination M.Socksaddr
 	if _, err = tlsConn.Write(ServerProof(verified.proofKey, exporter)); err != nil {
 		conn.Close()
 		return
 	}
-	version, command, flags, destination, err := readRequest(tlsConn)
-	if err != nil {
-		h.logger.DebugContext(ctx, "musess: read request failed: ", err)
-		conn.Close()
-		return
+	if h.earlyRequest {
+		// The proof goes first, in the stock order, on purpose:
+		// the flight saving comes from the *client* pipelining its
+		// sealed request with its handshake-completing flight
+		// (phase 1's model: the critical path runs through the
+		// request's arrival here, not the proof's arrival there),
+		// so by the time the proof is written the sealed request
+		// is already buffered and this read returns immediately.
+		// Reading first and proving second - the phase-1
+		// experiment's order - deadlocks against a stock client,
+		// which waits for the proof before sending anything
+		// (verified in phase 2: server-only enable hung the
+		// connection until the client gave up). With proof-first,
+		// readRequestAuto additionally accepts plain requests, so
+		// enabling early_request on the server alone is safe for
+		// stock clients; only the client side requires both peers.
+		version, command, flags, destination, err = readRequestAuto(tlsConn, verified.proofKey)
+		if err != nil {
+			h.logger.DebugContext(ctx, "musess: read early request failed: ", err)
+			conn.Close()
+			return
+		}
+	} else {
+		version, command, flags, destination, err = readRequest(tlsConn)
+		if err != nil {
+			h.logger.DebugContext(ctx, "musess: read request failed: ", err)
+			conn.Close()
+			return
+		}
 	}
 	// FEC negotiation: a v2 client that set both direction bits
 	// gets a one-byte answer — 0x01 if this inbound also has FEC
