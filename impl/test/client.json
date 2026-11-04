@@ -1,0 +1,63 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "hosts",
+        "tag": "hosts",
+        "predefined": {
+          "dest.test": [
+            "127.0.0.1"
+          ]
+        }
+      },
+      {
+        "type": "local",
+        "tag": "local"
+      }
+    ],
+    "rules": [
+      {
+        "domain": [
+          "dest.test"
+        ],
+        "action": "route",
+        "server": "hosts"
+      }
+    ],
+    "final": "local"
+  },
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "listen_port": 11080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "musess",
+      "tag": "musess-out",
+      "server": "127.0.0.1",
+      "server_port": __SERVER_PORT__,
+      "server_name": "dest.test",
+      "public_key": "__SERVER_PUBLIC_KEY__",
+      "uuid": "11111111-2222-3333-4444-555555555555",
+      "secret": "test-secret-milestone1"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "musess-out",
+    "default_domain_resolver": {
+      "server": "hosts"
+    }
+  }
+}

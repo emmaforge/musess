@@ -1,0 +1,65 @@
+{
+  "dns": {
+    "final": "local",
+    "rules": [
+      {
+        "action": "route",
+        "domain": [
+          "dest.test"
+        ],
+        "server": "hosts"
+      }
+    ],
+    "servers": [
+      {
+        "predefined": {
+          "dest.test": [
+            "127.0.0.1"
+          ]
+        },
+        "tag": "hosts",
+        "type": "hosts"
+      },
+      {
+        "tag": "local",
+        "type": "local"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "certificate_path": "__WORKDIR__/server-local.pem",
+      "dest": "dest.test",
+      "dest_address": "127.0.0.1",
+      "dest_port": 18443,
+      "key_path": "__WORKDIR__/server-local-key.pem",
+      "listen": "127.0.0.1",
+      "listen_port": 14443,
+      "private_key": "__SERVER_PRIVATE_KEY__",
+      "tag": "musess-in",
+      "type": "musess",
+      "users": [
+        {
+          "name": "emma",
+          "secret": "test-secret-milestone1",
+          "uuid": "11111111-2222-3333-4444-555555555555"
+        }
+      ]
+    }
+  ],
+  "log": {
+    "level": "debug",
+    "timestamp": true
+  },
+  "outbounds": [
+    {
+      "tag": "direct",
+      "type": "direct"
+    }
+  ],
+  "route": {
+    "default_domain_resolver": {
+      "server": "hosts"
+    }
+  }
+}
