@@ -67,6 +67,32 @@ type Options struct {
 	// exists for future unordered carriers (QUIC datagrams),
 	// where reordering makes instant proof unsound.
 	GapProofGrace time.Duration
+
+	// --- small-group spend policy (observation-3 companion) ---
+	// See spend.go for the analysis. All zero = off.
+
+	// SpendBatchMinK / SpendBatchBudget (packet mode only):
+	// while a protected group (its redundancy target > 0) is
+	// smaller than SpendBatchMinK, the flush timer holds it —
+	// re-arming instead of emitting — until the group reaches
+	// SpendBatchMinK or its age passes SpendBatchBudget. This
+	// amortises the one-parity-shard minimum price over more
+	// data shards. The hold never applies to unprotected
+	// groups (there is no spend to amortise) and never delays
+	// Close (the drain path emits directly).
+	SpendBatchMinK   int
+	SpendBatchBudget time.Duration
+	// SpendMinGroupK / SpendGateRho: at emit time, a group
+	// smaller than SpendMinGroupK spends no parity unless the
+	// group's redundancy target is at least SpendGateRho (the
+	// high-loss regime, where a parity shard's expected
+	// utilisation justifies its 1/k price). SpendGateRho also
+	// serves as the batching hold's disengage threshold (see
+	// holdForBatch): the two together define one regime
+	// boundary — batch and gate below it, today's full-parity
+	// small groups at or above it.
+	SpendMinGroupK int
+	SpendGateRho   float64
 }
 
 func (o *Options) applyDefaults() {
@@ -299,6 +325,7 @@ func (c *Conn) sendLoop() {
 	var group [][]byte
 	var groupK int
 	var groupRho float64
+	var groupStart time.Time
 	var groupID uint32
 	flushTimer := time.NewTimer(c.opts.FlushInterval)
 	if !flushTimer.Stop() {
@@ -346,6 +373,15 @@ func (c *Conn) sendLoop() {
 		// not the planned size: partial groups at flush boundaries
 		// must not inherit a full group's parity bill.
 		k, r := len(group), c.codec.ParityFor(len(group), groupRho)
+		// Small-group spend gate (experiment): a group smaller
+		// than SpendMinGroupK buys no parity unless the target
+		// redundancy says loss is high — at small k one parity
+		// shard costs 1/k of the group, and at low targets its
+		// expected utilisation does not pay that price
+		// (see spend.go).
+		if r > 0 && c.opts.SpendMinGroupK > 0 && k < c.opts.SpendMinGroupK && groupRho < c.opts.SpendGateRho {
+			r = 0
+		}
 		// Records: data first, then parity (ordered transport means
 		// the receiver can resolve as soon as the group is whole).
 		for i, shard := range group {
@@ -403,6 +439,7 @@ func (c *Conn) sendLoop() {
 			if len(group) == 0 {
 				groupRho = c.ctrl.Redundancy()
 				groupK, _ = c.codec.Plan(groupRho)
+				groupStart = time.Now()
 			}
 			group = append(group, msg.data)
 			if len(group) >= groupK {
@@ -412,6 +449,16 @@ func (c *Conn) sendLoop() {
 			}
 		case <-flushTimer.C:
 			timerArmed = false
+			if c.holdForBatch(len(group), groupRho, groupStart) {
+				// Batching hold (experiment): re-check after one
+				// more flush interval — arrivals may complete the
+				// group sooner (the emit-on-full path above is
+				// unaffected), and the budget check bounds the
+				// total hold to SpendBatchBudget + one interval.
+				flushTimer.Reset(c.opts.FlushInterval)
+				timerArmed = true
+				continue
+			}
 			emitGroup()
 		case <-c.closing:
 			// Drain everything still queued before the final
@@ -432,6 +479,7 @@ func (c *Conn) sendLoop() {
 					if len(group) == 0 {
 						groupRho = c.ctrl.Redundancy()
 						groupK, _ = c.codec.Plan(groupRho)
+						groupStart = time.Now()
 					}
 					group = append(group, msg.data)
 					if len(group) >= groupK {
@@ -444,6 +492,36 @@ func (c *Conn) sendLoop() {
 			}
 		}
 	}
+}
+
+// holdForBatch reports whether the flush timer should hold the
+// current group instead of emitting it, under the small-group
+// batching experiment (spend.go): the group is protected
+// (rho > 0 — there is a parity spend to amortise), still smaller
+// than SpendBatchMinK, and younger than SpendBatchBudget.
+// Packet mode only: interactive flows are the packet plane, and
+// holding byte-stream groups would tax bulk tail latency for a
+// problem the stream plane does not have at these group sizes.
+func (c *Conn) holdForBatch(groupLen int, rho float64, start time.Time) bool {
+	if c.opts.SpendBatchMinK <= 0 || c.opts.SpendBatchBudget <= 0 {
+		return false
+	}
+	if c.opts.Mode != ModePacket || rho <= 0 {
+		return false
+	}
+	// High-loss regime boundary (when SpendGateRho is also
+	// set): at targets at or above the gate, batching
+	// disengages — a batched group at the capped target is
+	// under-protected against loss clustering, while a small
+	// group taking full parity immediately is not (measured:
+	// trickle at 20% loss, see spend.go's README record).
+	if c.opts.SpendGateRho > 0 && rho >= c.opts.SpendGateRho {
+		return false
+	}
+	if groupLen == 0 || groupLen >= c.opts.SpendBatchMinK {
+		return false
+	}
+	return time.Since(start) < c.opts.SpendBatchBudget
 }
 
 func (c *Conn) encodeGroup(group [][]byte, r int) ([][]byte, error) {

@@ -1359,6 +1359,241 @@ sender cannot distinguish a lost group from lost feedback.
   `protocol/musess/fecwire.go`. Bench logs:
   `.tmp/exp-obs/{yield,trickle,trickle2,uobulk}.log`.
 
+#### Small-group spend policy (observation-3 companion, 2026-11-05)
+
+The deferred required companion from observation 3's verdict:
+eager gap synthesis makes the controllers engage at trickle,
+and the engaged spend is what fails DESIGN 5.4's budget.
+Prototype + measurement only — production defaults are
+unchanged; everything lives behind the `Spend*` Options
+fields and the credit codec (`spend.go`), reachable only
+from tests, with no `fecwire.go` wiring.
+
+The defect, priced: parity is charged per group
+(`ParityFor(k, rho) >= 1` for any positive target) but rho is
+a byte fraction, so the minimum nonzero spend on a group is
+1/k of it. At trickle the packet plane's groups are k=1
+(5 ms flush vs 10 ms spacing), and the estimator's ask at 5%
+loss is ~6.7% — a ~15x per-group overspend, blended by the
+yield wrapper and the engagement ramp to the measured
+incumbent: **99.33% delivery at 46.82% overhead, goodput
+0.57 Mbps against the no-FEC arm's 0.90, p50 873 ms** (this
+run's re-measurement of the eager arm; the observation-3
+record's 34.9–46.8% range stands).
+
+Candidates (analysis in `spend.go`): **(A) batching** — hold
+a protected group until k >= MinK or a delay budget expires,
+amortising the one-shard minimum price; **(B) fractional
+parity credit** — bank the exact fractional parity the
+target implies and spend whole shards only when the credit
+reaches one, so long-run spend equals the target;
+**(C) minimum-group gate** — groups below MinK ride raw
+unless the target reaches a high-loss gate. (B) was
+predicted dominated before measurement: the estimator's
+formula is a *coverage* fraction for populations where
+parity spreads across a group, and concentrating the spend
+on a rho-fraction of k=1 groups recovers only ~rho of the
+losses. It was prototyped anyway (a wrapper codec) so the
+prediction is falsified or confirmed by numbers, not taste.
+
+Method: fixed harness throughout, eager synthesis ON in
+every cell (the exposing configuration), paired seeds
+(trickle 31337+rep*7919, bulk 1234+rep*7919), 3 reps per
+cell, medians (ranges), sequential; host load checked
+<0.5 on 4 cores before each bench. Logs in `.tmp/spend/`.
+
+Pure batching price, isolated on the wire (sender Conn over
+a raw pipe, no loss/shim/receiver, static rho=0.10, hold =
+WriteMessage -> the message's data record on the wire):
+
+| setting | hold p50 | hold p95 | hold max |
+|---|---|---|---|
+| current (5 ms flush) | 5.2 ms | 5.3 ms | 5.3 ms |
+| batch k4 / 40 ms | 16.2 ms | 31.5 ms | 31.6 ms |
+| batch k8 / 80 ms | 43.1 ms | 73.6 ms | 83.2 ms |
+| batch k12 / 130 ms | 59.4 ms | 114.8 ms | 115.0 ms |
+
+Trickle cell (100 msg/s, 300x1200B, 5% uniform loss),
+rs + estimator, medians (ranges) over 3 reps:
+
+| arm | delivery % | goodput | p50 | p95 | overhead % |
+|---|---|---|---|---|---|
+| eager current | 99.33 (98.33–99.67) | 0.57 | 873 ms | 1924 ms | 46.82 |
+| batch k4 b40 | 97.00 (97.00–98.67) | 0.86 | 164 ms | 289 ms | 18.58 |
+| **batch k8 b80** | **97.67 (97.00–98.00)** | **0.90** | **123 ms** | **175 ms** | **11.31** |
+| batch k12 b130 | 97.00 (96.33–98.00) | 0.88 | 201 ms | 275 ms | 11.91 |
+| gate kmin4 r.12 | 94.33 (93.67–94.67) | 0.90 | 52 ms | 150 ms | 6.74 |
+| hybrid v1 (b8 + emit-gate) | 97.33 (97.00–98.67) | 0.89 | 146 ms | 212 ms | 12.11 |
+| credit | 94.00 (93.33–95.67) | 0.90 | 24 ms | 55 ms | 7.03 |
+| eager noFEC (reference) | 94.33 (92.33–94.67) | 0.90 | 14.7 ms | 56 ms | 0.83 |
+
+Fixed-step subset, same cell: current 96.00 / 0.70 /
+427 ms / 32.57%; batch k8 97.00 / 0.87 / 197 ms / 16.12%;
+gate 97.33 / 0.68 / 527 ms / 35.36% (delivery / goodput /
+p50 / overhead).
+
+Readings, in Emma's priority order (goodput, then
+overhead/budget, then latency):
+
+- **Batching k8/b80 dominates the incumbent on all three
+  metrics at once**: goodput 0.57 -> 0.90 (back to the
+  no-FEC level — the incumbent's parity spend was saturating
+  the 18%-headroom trickle link), overhead 46.82 -> 11.31%,
+  p50 873 -> 123 ms, for −1.66pt delivery. The 43 ms wire
+  hold is real but the end-to-end latency *falls* ~750 ms:
+  the incumbent's latency was spend queueing, not synthesis.
+  The frontier bends at k8: k4 is too coarse (r=1 over k=4
+  is a 20% achieved rate, 18.58% measured), and k12 buys
+  nothing — equal overhead (11.91%; ask-spike groups pay
+  r=2–3 even at k=12, because the estimator's instantaneous
+  target distribution has a fat upper tail on small
+  feedback windows), slightly lower delivery (larger groups
+  at r=1 fail on >=2 losses more often), and more hold.
+- **Credit is falsified as predicted**: spend tracks the
+  ask (7.03% measured vs ~6.7% ask + ~0.8% headers) and
+  delivery gain is nil (94.00 vs noFEC 94.33 — inside
+  noise of zero). Aligning spend with the target's
+  accounting identity surrenders the outcome the target
+  exists for. Rejected.
+- **The gate alone is controller-dependent**, because it
+  thresholds the controller's *instantaneous* target: with
+  the estimator (smooth ~6.7% ask at 5% loss) it stays shut
+  except on noise crossings — 6.74% spent on randomly
+  opened windows for exactly the no-FEC delivery (94.33).
+  With fixed-step (quantised 0.10/0.15 targets) the top
+  step clears the 0.12 gate and protection engages
+  (97.33% delivery, at 35.36% overhead). A gate threshold
+  cannot be chosen controller-agnostically; recorded as a
+  property of the mechanism, not a tuning miss.
+- **At 20% loss the ranking inverts** (same cell, 20%
+  uniform): current 95.33 / 0.62 / 696 ms / 49.44%; batch
+  k8 **86.00** (83.67–89.67) / 0.78 / 128 ms / 20.22%;
+  gate 95.33 / 0.63 / 658 ms / 48.66%; hybrid v1 87.67 /
+  0.78 / 129 ms / 20.01%. Batching amortises parity by
+  spreading the *capped* target thinner, and at 20% loss
+  the binding constraint is loss clustering, not
+  quantisation: P(>=3 losses in k=8) ~ 20% against r=2,
+  while an unbatched k=1 group at r=1 recovers whenever
+  its parity shard survives (delivery ~ 0.80 + 0.20*0.80
+  = 0.96, matching the incumbent). The gate arm *is* the
+  incumbent at 20% (the estimator sits at the 0.15 cap,
+  above the gate) — the two regimes need opposite group
+  shapes, and the switch has to be the target itself.
+
+Composed arm (batching + gate on one boundary; the hold
+disengages at targets >= the gate, the emit gate covers
+groups still small at flush), two boundary settings, both
+trickle cells, 3 reps:
+
+| arm | @5%: delivery / goodput / p50 / overhead | @20%: delivery / goodput / p50 / overhead |
+|---|---|---|
+| hybrid2, boundary 0.12 | 97.33 / 0.83 / 157–267 ms / 14.36–17.21% (two median sets) | 95.67 / 0.63 / 652–689 ms / 49.44–49.53% |
+| hybrid3, boundary 0.15 | 97.33 / 0.85 / 124 ms / 10.77% | 94.67 / 0.63 / 693 ms / 47.76% |
+
+The 0.12 boundary sits *inside* the estimator's ask noise
+at 5% loss (small feedback windows push the EWMA to the
+cap in isolated spikes), so it chatters: two independent
+3-rep runs of the same arm gave overhead medians of 14.36
+and 17.21% and p50 of 157 and 267 ms — a variable tax for
+recovering the incumbent exactly at 20%. The 0.15 boundary
+(at the cap) is quiet at 5% (10.77% overhead, p50 124 ms —
+statistically the batch-k8 row) and near-incumbent at 20%
+(delivery −0.66pt vs current, ranges overlapping:
+93.33–95.33 vs 95.00–95.67; the residual tax is windows
+where the EWMA dips just below the cap and a few groups
+batch). An instantaneous threshold cannot distinguish
+"touching the cap" from "pinned at the cap"; a
+persistence-qualified boundary (target at cap for N
+consecutive windows) is the refinement a landing change
+should carry — designed here, **not measured**.
+
+Composition evidence (traces, seed 31337, estimator stack
+with the yield wrapper inside the trace): every arm's
+first nonzero feedback window is #3 at t=0.41s, ratio
+0.091 — eager accounting is policy-invariant, as it must
+be. Applied-redundancy ranges: current [0.018, 0.150] with
+5 post-engagement zero windows (the yield wrapper
+collapsing under the spend's own backlog); batch k8
+[0.020, 0.150] with **0**; gate [0.028, 0.135] with 0;
+credit [0.028, 0.127] with 0; hybrid v1 2. No arm shows
+engage/disengage oscillation; batching is
+composition-*positive* (it removes the backlog that was
+driving the yield flapping), the gate and credit are
+stateless at emit/pricing time and cannot feed back into
+the controller. The fixed-step subset above cross-checks
+batching under the second controller (helps there too:
+overhead 32.57 -> 16.12%, delivery +1.0pt, goodput
+0.70 -> 0.87).
+
+Bulk no-regression (uniform spot cells, repetitions link,
+eager on, rs + estimator, medians over 3 reps): at 5%
+every arm delivers 97.15–97.30% at 7.33–7.63% overhead;
+at 10%, 92.90–93.60% at 9.27–9.51%; at 20%, 81.73–82.33%
+at 10.09–10.29% (full table in `.tmp/spend/bulk.log`).
+No arm regresses any bulk cell beyond jitter (delivery
+spread across arms <=0.15pt at 5%, <=0.70pt at 10%,
+<=0.60pt at 20%; overhead spread <=0.30pt): at bulk
+arrival rates the holds never bind except at flush
+tails, the gate's k threshold sits below natural group
+sizes, and the credit codec delegates at k>=4 by
+construction.
+
+**Verdict — the policy that should gate FEC-on for
+interactive flows is the composed one**: batch toward
+k>=8 under an 80 ms budget while the target is below the
+boundary; boundary at the cap end (0.15 measured quiet,
+0.12 measured chattery); groups still below k=8 when the
+budget expires ride raw below the boundary (the emit
+gate) rather than paying 1/k at a low target; at or above
+the boundary, today's behaviour (immediate small groups
+at full parity). Priced at 5% loss (hybrid3 vs incumbent):
+overhead 46.82 -> 10.77%, goodput 0.57 -> 0.85, p50
+873 -> 124 ms, delivery 99.33 -> 97.33%. At 20% loss:
+delivery −0.66pt and overhead −1.7pt against the
+incumbent — the policy is regime-shaped on purpose.
+Thresholds the measurements support: **MinK 8** (k4 too
+coarse, k12 no gain), **budget 80 ms** (the 130 ms arm
+buys nothing; the pure hold at k8/b80 is p50 43 / p95
+74 ms, and end-to-end it is repaid by un-queueing in
+this cell), **boundary 0.15, not 0.12**, **gate threshold
+= batch MinK**. Two honest limits on the win: 10.77%
+still exceeds DESIGN 5.4's 8% budget at 5% loss — no
+measured arm reaches <=8% while actually protecting
+(credit and gate get under it only by not protecting) —
+and the composed policy's high-loss spend is the
+incumbent's ~48%, which is the measured price of 95%
+delivery at 20% loss on k=1-shaped flows, not a saving.
+
+Still unmeasured: the persistence-qualified boundary;
+the batching hold as a *pure addition* on an uncongested
+link (in this cell it is repaid by un-queueing — a
+higher-headroom trickle link would isolate it); message
+rates other than 100/s (at 500/s a k=8 batch fills in
+~14 ms and the hold nearly vanishes; below 100/s the
+budget expires with k<8 more often and the gate carries
+more weight); burst loss at trickle; composition with
+unordered packet delivery switched on (all spend cells
+ran ordered + eager); anything off this rig (WAN, QUIC
+carrier) — as everywhere in this record.
+
+Regression gates for this work: `go vet` clean (fec,
+musess, option); full fec and musess unit tests pass,
+including four new spend tests (credit accounting and
+delegation, gate below/above/off at the endpoint, batching
+formation + budget expiry + regime-boundary disengage).
+FEC e2e (`test/run-e2e-fec.sh`) **6/6 with flags off** on
+the rebuilt binary; milestone-1 e2e **5 passed, 1 failed —
+the established profile** (check (d), sandbox UDP EPERM).
+Nothing in production construction paths changed: the
+`Spend*` zero values and an unwrapped codec reproduce
+milestone-2 behaviour exactly, and `fecwire.go` does not
+reference the spend fields. Files: `spend.go` (analysis +
+credit codec), `spend_test.go`, `spend_bench_test.go`
+(`TestSpendTrickle{,20}`, `TestSpendHybrid2`,
+`TestSpendBulk`, `TestSpendTraces`, `TestSpendHoldWire`),
+the `Spend*` fields + emit gate + flush hold in
+`endpoint.go`. Bench logs: `.tmp/spend/`.
+
 ## Overhead vs the ≤8% shaping budget (DESIGN.md 5.4)
 
 The 8% budget in the design text is written for shaping/padding
