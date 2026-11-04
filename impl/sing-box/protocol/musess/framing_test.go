@@ -79,9 +79,12 @@ func TestRequestHeaderRoundTrip(t *testing.T) {
 	go func() {
 		_ = writeRequest(clientConn, commandUDP, destination)
 	}()
-	command, got, err := readRequest(serverConn)
+	version, command, flags, got, err := readRequest(serverConn)
 	if err != nil {
 		t.Fatal("readRequest:", err)
+	}
+	if version != framingVersion || flags != 0 {
+		t.Fatalf("v1 header: version %d flags %d", version, flags)
 	}
 	if command != commandUDP {
 		t.Fatalf("command mismatch: %d", command)
@@ -90,4 +93,28 @@ func TestRequestHeaderRoundTrip(t *testing.T) {
 		t.Fatalf("destination mismatch: got %v, want %v", got, destination)
 	}
 	_ = io.Discard
+}
+
+func TestRequestHeaderV2RoundTrip(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	destination := M.ParseSocksaddr("dest.test:8443")
+	go func() {
+		_ = writeRequestV2(clientConn, commandTCP, destination, fecFlagForward|fecFlagReverse)
+	}()
+	version, command, flags, got, err := readRequest(serverConn)
+	if err != nil {
+		t.Fatal("readRequest:", err)
+	}
+	if version != framingVersion2 {
+		t.Fatalf("version: got %d want %d", version, framingVersion2)
+	}
+	if flags != fecFlagForward|fecFlagReverse {
+		t.Fatalf("flags: got %d", flags)
+	}
+	if command != commandTCP {
+		t.Fatalf("command mismatch: %d", command)
+	}
+	if got != destination {
+		t.Fatalf("destination mismatch: got %v, want %v", got, destination)
+	}
 }

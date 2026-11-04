@@ -15,6 +15,13 @@
 //	                             then report the first response bytes
 //	sid -file                    print the hex session ID inside a captured ClientHello
 //	udpecho -addr                UDP echo server (payload returned verbatim)
+//	shim -listen -target -delay-ms -hold-prob -hold-ms -chunk
+//	                             user-space TCP impairment shim (delay/hold
+//	                             model, NOT packet loss; see runShim)
+//	bulkserver -port             stream an endless repeating pattern on TCP
+//	bulkclient -addr [-socks] -bytes
+//	                             read exactly -bytes as fast as possible and
+//	                             print bytes/seconds/mbps
 package main
 
 import (
@@ -29,17 +36,21 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: helper <keygen|dest|sniff|replay|sid|udpecho> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: helper <keygen|dest|sniff|replay|sid|udpecho|shim|bulkserver|bulkclient> [flags]")
 		os.Exit(2)
 	}
 	var err error
@@ -60,6 +71,12 @@ func main() {
 		err = runUDPEcho(os.Args[2:])
 	case "udpclient":
 		err = runUDPClient(os.Args[2:])
+	case "shim":
+		err = runShim(os.Args[2:])
+	case "bulkserver":
+		err = runBulkServer(os.Args[2:])
+	case "bulkclient":
+		err = runBulkClient(os.Args[2:])
 	default:
 		err = fmt.Errorf("unknown subcommand %q", os.Args[1])
 	}
@@ -475,4 +492,319 @@ func runUDPEcho(args []string) error {
 			fmt.Fprintf(os.Stderr, "udpecho: reply write error: %v\n", werr)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// shim: user-space TCP impairment shim (milestone-2 bench infrastructure)
+//
+// Model (be precise — this is NOT packet loss and NOT netem):
+//   - The shim is a plain TCP relay: it listens on -listen, dials -target
+//     for each accepted connection, and splices the two directions.
+//   - Each direction reads the source in -chunk KiB reads. Every chunk is
+//     timestamped on arrival and released to the destination no earlier
+//     than arrival + -delay-ms (fixed store-and-forward delay, per chunk,
+//     per direction), strictly preserving chunk order: a single writer
+//     goroutine per direction sleeps until the head chunk's release time
+//     and writes chunks in arrival order.
+//   - Hold model (-hold-prob P, -hold-ms M): each chunk independently,
+//     with probability P, has M extra milliseconds added to its own
+//     release time. Because the writer is strictly ordered, a held chunk
+//     blocks every chunk queued behind it until it is released — this
+//     emulates the head-of-line stall a lost segment causes on a TCP
+//     byte stream (where the receiver cannot deliver later bytes until
+//     the retransmission arrives). No bytes are ever dropped, duplicated
+//     or reordered; all impairment is delay. Reports and scripts must
+//     describe it as a "delay/hold" model, never as packet loss.
+//   - Throughput note: chunks are pipelined through a deep release queue
+//     (4096 chunks), so a fixed delay adds latency without capping
+//     steady-state throughput until the queue's bytes/delay ceiling
+//     (4096*chunkKiB per delay interval) is reached.
+//   - On SIGINT/SIGTERM the shim prints total forwarded byte counts per
+//     direction and the connection count, then exits.
+func runShim(args []string) error {
+	fs := flag.NewFlagSet("shim", flag.ExitOnError)
+	listenAddr := fs.String("listen", "", "listen address, e.g. 127.0.0.1:15451")
+	targetAddr := fs.String("target", "", "forward target address, e.g. 127.0.0.1:14443")
+	delayMs := fs.Int("delay-ms", 0, "fixed store-and-forward delay per chunk, milliseconds")
+	holdProb := fs.Float64("hold-prob", 0, "probability a chunk gets an extra hold (0..1)")
+	holdMs := fs.Int("hold-ms", 0, "extra hold added to a chunk's release time, milliseconds")
+	chunkKB := fs.Int("chunk", 16, "read chunk size, KiB")
+	_ = fs.Parse(args)
+	if *listenAddr == "" || *targetAddr == "" {
+		return fmt.Errorf("shim requires -listen and -target")
+	}
+	if *holdProb < 0 || *holdProb > 1 {
+		return fmt.Errorf("shim: -hold-prob must be in [0,1]")
+	}
+
+	var bytesUp, bytesDown, connCount atomic.Int64
+
+	listener, err := net.Listen("tcp", *listenAddr)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("shim listening on %s -> %s (delay/hold model, NOT packet loss: delay=%dms hold-prob=%g hold=%dms chunk=%dKiB)\n",
+		*listenAddr, *targetAddr, *delayMs, *holdProb, *holdMs, *chunkKB)
+
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		fmt.Printf("shim exit: bytes client->target=%d target->client=%d connections=%d\n",
+			bytesUp.Load(), bytesDown.Load(), connCount.Load())
+		os.Exit(0)
+	}()
+
+	for {
+		client, err := listener.Accept()
+		if err != nil {
+			return err
+		}
+		connCount.Add(1)
+		go func(client net.Conn) {
+			defer client.Close()
+			target, err := net.DialTimeout("tcp", *targetAddr, 10*time.Second)
+			if err != nil {
+				return
+			}
+			defer target.Close()
+			done := make(chan struct{}, 2)
+			go func() {
+				shimPump(client, target, *delayMs, *holdProb, *holdMs, *chunkKB, &bytesUp)
+				done <- struct{}{}
+			}()
+			go func() {
+				shimPump(target, client, *delayMs, *holdProb, *holdMs, *chunkKB, &bytesDown)
+				done <- struct{}{}
+			}()
+			<-done
+		}(client)
+	}
+}
+
+// shimPump forwards src -> dst applying the delay/hold model described
+// on runShim. It half-closes dst's write side when src reaches EOF so
+// the peer sees a clean end of stream, and adds forwarded bytes to
+// counter.
+func shimPump(src, dst net.Conn, delayMs int, holdProb float64, holdMs int, chunkKB int, counter *atomic.Int64) {
+	type timedChunk struct {
+		data    []byte
+		release time.Time
+	}
+	// Deep queue: pipelining headroom so fixed delay does not become a
+	// throughput cap at bench rates (see runShim comment).
+	queue := make(chan timedChunk, 4096)
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for tc := range queue {
+			if wait := time.Until(tc.release); wait > 0 {
+				time.Sleep(wait)
+			}
+			data := tc.data
+			for len(data) > 0 {
+				n, err := dst.Write(data)
+				if err != nil {
+					// Drain the queue so the reader never blocks on a
+					// dead destination, then stop.
+					go func() {
+						for range queue {
+						}
+					}()
+					return
+				}
+				counter.Add(int64(n))
+				data = data[n:]
+			}
+		}
+	}()
+	rng := mrand.New(mrand.NewSource(time.Now().UnixNano()))
+	delay := time.Duration(delayMs) * time.Millisecond
+	hold := time.Duration(holdMs) * time.Millisecond
+	buf := make([]byte, chunkKB*1024)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			arrival := time.Now()
+			release := arrival.Add(delay)
+			if holdProb > 0 && rng.Float64() < holdProb {
+				release = release.Add(hold)
+			}
+			chunk := make([]byte, n)
+			copy(chunk, buf[:n])
+			queue <- timedChunk{data: chunk, release: release}
+		}
+		if err != nil {
+			break
+		}
+	}
+	close(queue)
+	<-writerDone
+	if tcpConn, ok := dst.(*net.TCPConn); ok {
+		_ = tcpConn.CloseWrite()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// bulkserver / bulkclient: bulk-transfer goodput tools
+//
+// bulkserver listens on 127.0.0.1:-port and, per connection, streams an
+// endless repeating 64 KiB pattern until the peer goes away.
+//
+// bulkclient dials -addr (optionally through a SOCKS5 proxy given by
+// -socks, in which case -addr is the ultimate target), reads exactly
+// -bytes bytes as fast as it can, and prints one line:
+//
+//	bytes=<n> seconds=<f> mbps=<f>
+//
+// The timer starts just before dialling (so connection/handshake cost
+// of the leg under test is included) and stops when the last byte has
+// been read. mbps is decimal megabits per second (bytes*8/seconds/1e6).
+func runBulkServer(args []string) error {
+	fs := flag.NewFlagSet("bulkserver", flag.ExitOnError)
+	port := fs.Int("port", 0, "TCP port to listen on (127.0.0.1)")
+	_ = fs.Parse(args)
+	if *port <= 0 {
+		return fmt.Errorf("bulkserver requires -port")
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(*port))
+	if err != nil {
+		return err
+	}
+	fmt.Println("bulkserver listening on", listener.Addr())
+	pattern := make([]byte, 64*1024)
+	for i := range pattern {
+		pattern[i] = byte(i % 251)
+	}
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			return err
+		}
+		go func(conn net.Conn) {
+			defer conn.Close()
+			for {
+				if _, err := conn.Write(pattern); err != nil {
+					return
+				}
+			}
+		}(conn)
+	}
+}
+
+func runBulkClient(args []string) error {
+	fs := flag.NewFlagSet("bulkclient", flag.ExitOnError)
+	addr := fs.String("addr", "", "target address host:port to read from")
+	socks := fs.String("socks", "", "optional SOCKS5 proxy address host:port; -addr is then the target reached through it")
+	numBytes := fs.Int64("bytes", 32<<20, "number of bytes to read")
+	_ = fs.Parse(args)
+	if *addr == "" {
+		return fmt.Errorf("bulkclient requires -addr")
+	}
+
+	start := time.Now()
+	var conn net.Conn
+	var err error
+	if *socks != "" {
+		conn, err = socks5Dial(*socks, *addr)
+	} else {
+		conn, err = net.DialTimeout("tcp", *addr, 10*time.Second)
+	}
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	buf := make([]byte, 256*1024)
+	var got int64
+	for got < *numBytes {
+		want := int64(len(buf))
+		if rem := *numBytes - got; rem < want {
+			want = rem
+		}
+		n, rerr := conn.Read(buf[:want])
+		got += int64(n)
+		if rerr != nil {
+			return fmt.Errorf("bulkclient: read %d of %d bytes: %w", got, *numBytes, rerr)
+		}
+	}
+	seconds := time.Since(start).Seconds()
+	mbps := float64(got) * 8 / seconds / 1e6
+	fmt.Printf("bytes=%d seconds=%.3f mbps=%.2f\n", got, seconds, mbps)
+	return nil
+}
+
+// socks5Dial connects to targetAddr (IPv4 host:port) through the
+// SOCKS5 proxy at proxyAddr using no-auth CONNECT, and returns the
+// tunnelled connection.
+func socks5Dial(proxyAddr, targetAddr string) (net.Conn, error) {
+	host, portStr, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		return nil, err
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.To4() == nil {
+		return nil, fmt.Errorf("bulkclient: -addr host must be an IPv4 address, got %q", host)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.DialTimeout("tcp", proxyAddr, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(err error) (net.Conn, error) {
+		conn.Close()
+		return nil, err
+	}
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		return fail(err)
+	}
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return fail(err)
+	}
+	if resp[0] != 0x05 || resp[1] != 0x00 {
+		return fail(fmt.Errorf("bulkclient: SOCKS no-auth negotiation rejected: %x", resp))
+	}
+	req := []byte{0x05, 0x01, 0x00, 0x01}
+	req = append(req, ip.To4()...)
+	req = append(req, byte(port>>8), byte(port))
+	if _, err := conn.Write(req); err != nil {
+		return fail(err)
+	}
+	head := make([]byte, 4)
+	if _, err := io.ReadFull(conn, head); err != nil {
+		return fail(err)
+	}
+	if head[1] != 0x00 {
+		return fail(fmt.Errorf("bulkclient: SOCKS CONNECT failed, rep=%d", head[1]))
+	}
+	switch head[3] {
+	case 0x01:
+		skip := make([]byte, 4+2)
+		if _, err := io.ReadFull(conn, skip); err != nil {
+			return fail(err)
+		}
+	case 0x03:
+		lenByte := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenByte); err != nil {
+			return fail(err)
+		}
+		skip := make([]byte, int(lenByte[0])+2)
+		if _, err := io.ReadFull(conn, skip); err != nil {
+			return fail(err)
+		}
+	case 0x04:
+		skip := make([]byte, 16+2)
+		if _, err := io.ReadFull(conn, skip); err != nil {
+			return fail(err)
+		}
+	default:
+		return fail(fmt.Errorf("bulkclient: SOCKS reply has unknown atyp %d", head[3]))
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return conn, nil
 }

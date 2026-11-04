@@ -20,9 +20,15 @@ type MusessInboundOptions struct {
 	// the inbound presents to *authenticated* clients when it terminates
 	// TLS locally. Unauthenticated connections never see this
 	// certificate: they are forwarded to the real destination.
-	CertificatePath string `json:"certificate_path,omitempty"`
-	KeyPath         string `json:"key_path,omitempty"`
+	CertificatePath string       `json:"certificate_path,omitempty"`
+	KeyPath         string       `json:"key_path,omitempty"`
 	Users           []MusessUser `json:"users,omitempty"`
+	// FEC selects the application-layer adaptive FEC (DESIGN.md
+	// 5.2): "" or "off" disables it (milestone-1 wire behaviour);
+	// "auto" is adaptive and disengages below 1% measured loss;
+	// "on" is adaptive with a redundancy floor. FEC is used only
+	// when both peers enable it.
+	FEC string `json:"fec,omitempty"`
 }
 
 type MusessUser struct {
@@ -41,4 +47,8 @@ type MusessOutboundOptions struct {
 	PublicKey string `json:"public_key,omitempty"`
 	UUID      string `json:"uuid,omitempty"`
 	Secret    string `json:"secret,omitempty"`
+	// FEC: see MusessInboundOptions.FEC. The outbound requests FEC
+	// when set to "auto" or "on"; the server may decline, in which
+	// case the connection runs without it.
+	FEC string `json:"fec,omitempty"`
 }

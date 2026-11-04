@@ -1,0 +1,1 @@
+{"inbounds":[{"listen":"127.0.0.1","listen_port":14446,"method":"2022-blake3-aes-128-gcm","password":"WmIgH+K66ffh1nBdExuK3w==","tag":"ss-in","type":"shadowsocks"}],"log":{"level":"info","timestamp":true},"outbounds":[{"tag":"direct","type":"direct"}]}

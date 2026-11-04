@@ -20,9 +20,24 @@ import (
 
 const (
 	framingVersion = 0x01
-	commandTCP     = 0x01
-	commandUDP     = 0x02
+	// framingVersion2 adds a flags byte to the request header for
+	// FEC negotiation. Peers that only speak v1 keep the exact
+	// milestone-1 wire behaviour.
+	framingVersion2   = 0x02
+	commandTCP        = 0x01
+	commandUDP        = 0x02
 	serverProofLength = 32
+)
+
+// Request-header flags (v2 only).
+const (
+	// fecFlagForward: the sender protects its sending direction
+	// with FEC records and asks the peer to do the same in reverse
+	// (FEC is negotiated as a symmetric duplex; see fecwire.go).
+	fecFlagForward = 0x01
+	// fecFlagReverse: the sender accepts FEC records in the
+	// reverse direction.
+	fecFlagReverse = 0x02
 )
 
 func writeRequest(w io.Writer, command byte, destination M.Socksaddr) error {
@@ -37,19 +52,44 @@ func writeRequest(w io.Writer, command byte, destination M.Socksaddr) error {
 	return err
 }
 
-func readRequest(r io.Reader) (command byte, destination M.Socksaddr, err error) {
+func writeRequestV2(w io.Writer, command byte, destination M.Socksaddr, flags byte) error {
+	header := buf.NewSize(3 + M.MaxSocksaddrLength)
+	header.WriteByte(framingVersion2)
+	header.WriteByte(command)
+	header.WriteByte(flags)
+	err := M.SocksaddrSerializer.WriteAddrPort(header, destination)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(header.Bytes())
+	return err
+}
+
+// readRequest parses a v1 or v2 request header. It returns the
+// header version and flags (zero for v1) alongside command and
+// destination.
+func readRequest(r io.Reader) (version byte, command byte, flags byte, destination M.Socksaddr, err error) {
 	var preamble [2]byte
 	if _, err = io.ReadFull(r, preamble[:]); err != nil {
-		return 0, M.Socksaddr{}, err
+		return 0, 0, 0, M.Socksaddr{}, err
 	}
-	if preamble[0] != framingVersion {
-		return 0, M.Socksaddr{}, errors.New("musess: unsupported framing version")
+	version = preamble[0]
+	switch version {
+	case framingVersion:
+	case framingVersion2:
+		var flagByte [1]byte
+		if _, err = io.ReadFull(r, flagByte[:]); err != nil {
+			return 0, 0, 0, M.Socksaddr{}, err
+		}
+		flags = flagByte[0]
+	default:
+		return 0, 0, 0, M.Socksaddr{}, errors.New("musess: unsupported framing version")
 	}
 	destination, err = M.SocksaddrSerializer.ReadAddrPort(r)
 	if err != nil {
-		return 0, M.Socksaddr{}, err
+		return 0, 0, 0, M.Socksaddr{}, err
 	}
-	return preamble[1], destination, nil
+	return version, preamble[1], flags, destination, nil
 }
 
 // streamPacketConn adapts the framed TLS stream to sing's PacketConn:
@@ -125,15 +165,28 @@ func (c *streamPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	return len(p), nil
 }
 
+// framedPacketConn is the packet-framing interface shared by the
+// plain stream packet conn and the FEC packet conn.
+type framedPacketConn interface {
+	ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error)
+	WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error
+	Close() error
+	LocalAddr() net.Addr
+	RemoteAddr() net.Addr
+	SetDeadline(t time.Time) error
+	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
+}
+
 // packetStreamConn adapts a packet connection bound to one fixed
 // destination to a net.Conn (used for outbound DialContext with UDP).
 type packetStreamConn struct {
-	packetConn *streamPacketConn
+	packetConn  framedPacketConn
 	destination M.Socksaddr
-	leftover   []byte
+	leftover    []byte
 }
 
-func newPacketStreamConn(packetConn *streamPacketConn, destination M.Socksaddr) *packetStreamConn {
+func newPacketStreamConn(packetConn framedPacketConn, destination M.Socksaddr) *packetStreamConn {
 	return &packetStreamConn{packetConn: packetConn, destination: destination}
 }
 

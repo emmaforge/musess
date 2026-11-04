@@ -1,0 +1,31 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "listen_port": 11082
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "ss-out",
+      "server": "127.0.0.1",
+      "server_port": __SERVER_PORT__,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "WmIgH+K66ffh1nBdExuK3w=="
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "ss-out"
+  }
+}

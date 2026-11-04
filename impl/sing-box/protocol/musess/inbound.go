@@ -30,15 +30,16 @@ func RegisterInbound(registry *inbound.Registry) {
 
 type Inbound struct {
 	inbound.Adapter
-	router     adapter.ConnectionRouterEx
-	logger     logger.ContextLogger
-	listener   *listener.Listener
-	destName   string
+	router       adapter.ConnectionRouterEx
+	logger       logger.ContextLogger
+	listener     *listener.Listener
+	destName     string
 	destDialAddr string
-	privateKey *ecdh.PrivateKey
-	certificate stdtls.Certificate
-	users      []userEntry
-	replay     *replayCache
+	privateKey   *ecdh.PrivateKey
+	certificate  stdtls.Certificate
+	users        []userEntry
+	replay       *replayCache
+	fecMode      fecMode
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MusessInboundOptions) (adapter.Inbound, error) {
@@ -65,6 +66,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if destHost == "" {
 		destHost = options.Dest
 	}
+	mode, err := parseFECMode(options.FEC)
+	if err != nil {
+		return nil, err
+	}
 	inbound := &Inbound{
 		Adapter:      inbound.NewAdapter(C.TypeMusess, tag),
 		router:       routerEx,
@@ -74,6 +79,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		privateKey:   privateKey,
 		certificate:  certificate,
 		replay:       newReplayCache(),
+		fecMode:      mode,
 	}
 	for _, user := range options.Users {
 		inbound.users = append(inbound.users, makeUserEntry(user.Name, user.UUID, user.Secret))
@@ -185,11 +191,33 @@ func (h *Inbound) serveAuthenticated(ctx context.Context, conn net.Conn, reader 
 		conn.Close()
 		return
 	}
-	command, destination, err := readRequest(tlsConn)
+	version, command, flags, destination, err := readRequest(tlsConn)
 	if err != nil {
 		h.logger.DebugContext(ctx, "musess: read request failed: ", err)
 		conn.Close()
 		return
+	}
+	// FEC negotiation: a v2 client that set both direction bits
+	// gets a one-byte answer — 0x01 if this inbound also has FEC
+	// enabled (duplex active), 0x00 otherwise. A v1 client never
+	// reads a status byte and never gets one.
+	fecActive := false
+	if version == framingVersion2 {
+		fecActive = h.fecMode.enabled() && flags&fecFlagForward != 0 && flags&fecFlagReverse != 0
+		status := byte(0x00)
+		if fecActive {
+			status = 0x01
+		}
+		if _, err = tlsConn.Write([]byte{status}); err != nil {
+			conn.Close()
+			return
+		}
+		if flags&fecFlagForward != 0 && !fecActive {
+			h.logger.DebugContext(ctx, "musess: client requested FEC but inbound fec mode is ", h.fecMode.optionString())
+		}
+		if fecActive {
+			h.logger.InfoContext(ctx, "musess: FEC duplex active (mode ", h.fecMode.optionString(), ") for ", metadata.Source)
+		}
 	}
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
@@ -198,7 +226,11 @@ func (h *Inbound) serveAuthenticated(ctx context.Context, conn net.Conn, reader 
 	switch command {
 	case commandTCP:
 		h.logger.InfoContext(ctx, "[", verified.user.name, "] inbound connection to ", destination)
-		h.router.RouteConnectionEx(ctx, tlsConn, metadata, onClose)
+		if fecActive {
+			h.router.RouteConnectionEx(ctx, newFECConn(tlsConn, h.fecMode, false, h.logger), metadata, onClose)
+		} else {
+			h.router.RouteConnectionEx(ctx, tlsConn, metadata, onClose)
+		}
 	case commandUDP:
 		h.logger.InfoContext(ctx, "[", verified.user.name, "] inbound packet connection to ", destination)
 		// A musess UDP stream is an association opened for the
@@ -208,7 +240,11 @@ func (h *Inbound) serveAuthenticated(ctx context.Context, conn net.Conn, reader 
 		// still carried in the framing, and the client side never
 		// mixes destinations on one stream.
 		metadata.UDPConnect = true
-		h.router.RoutePacketConnectionEx(ctx, newStreamPacketConn(tlsConn), metadata, onClose)
+		if fecActive {
+			h.router.RoutePacketConnectionEx(ctx, newFECPacketConn(newFECConn(tlsConn, h.fecMode, true, h.logger)), metadata, onClose)
+		} else {
+			h.router.RoutePacketConnectionEx(ctx, newStreamPacketConn(tlsConn), metadata, onClose)
+		}
 	default:
 		h.logger.DebugContext(ctx, "musess: unknown command ", command)
 		conn.Close()

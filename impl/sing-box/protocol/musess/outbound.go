@@ -35,6 +35,7 @@ type Outbound struct {
 	serverPublic *ecdh.PublicKey
 	uuid         string
 	secret       string
+	fecMode      fecMode
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MusessOutboundOptions) (adapter.Outbound, error) {
@@ -50,6 +51,10 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if serverName == "" {
 		serverName = options.Server
 	}
+	mode, err := parseFECMode(options.FEC)
+	if err != nil {
+		return nil, err
+	}
 	return &Outbound{
 		Adapter:      outbound.NewAdapterWithDialerOptions(C.TypeMusess, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
 		logger:       logger,
@@ -59,6 +64,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		serverPublic: serverPublic,
 		uuid:         options.UUID,
 		secret:       options.Secret,
+		fecMode:      mode,
 	}, nil
 }
 
@@ -66,14 +72,21 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
 		h.logger.InfoContext(ctx, "outbound connection to ", destination)
-		return h.dialStream(ctx, commandTCP, destination)
+		stream, fecActive, err := h.dialStream(ctx, commandTCP, destination)
+		if err != nil {
+			return nil, err
+		}
+		if fecActive {
+			return newFECConn(stream, h.fecMode, false, h.logger), nil
+		}
+		return stream, nil
 	case N.NetworkUDP:
 		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 		packetConn, err := h.ListenPacket(ctx, destination)
 		if err != nil {
 			return nil, err
 		}
-		return newPacketStreamConn(packetConn.(*streamPacketConn), destination), nil
+		return newPacketStreamConn(packetConn.(framedPacketConn), destination), nil
 	default:
 		return nil, E.New("unsupported network: ", network)
 	}
@@ -81,9 +94,12 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
-	stream, err := h.dialStream(ctx, commandUDP, destination)
+	stream, fecActive, err := h.dialStream(ctx, commandUDP, destination)
 	if err != nil {
 		return nil, err
+	}
+	if fecActive {
+		return newFECPacketConn(newFECConn(stream, h.fecMode, true, h.logger)), nil
 	}
 	return newStreamPacketConn(stream), nil
 }
@@ -97,36 +113,57 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 // handshake state exposes; that private key doubles as the musess
 // auth ephemeral, binding the auth tag to the very key exchange that
 // becomes the TLS session.
-func (h *Outbound) dialStream(ctx context.Context, command byte, destination M.Socksaddr) (net.Conn, error) {
+// dialStream establishes one authenticated musess TLS connection
+// and sends the request header. It returns the raw TLS connection
+// and whether FEC was negotiated (v2 header + server status byte).
+func (h *Outbound) dialStream(ctx context.Context, command byte, destination M.Socksaddr) (net.Conn, bool, error) {
 	rawConn, err := h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	tlsConn, sessionAuth, err := h.clientHandshake(ctx, rawConn)
 	if err != nil {
 		rawConn.Close()
-		return nil, err
+		return nil, false, err
 	}
 	connState := tlsConn.ConnectionState()
 	exporter, err := connState.ExportKeyingMaterial("musess", nil, 32)
 	if err != nil {
 		tlsConn.Close()
-		return nil, E.Cause(err, "musess: export keying material")
+		return nil, false, E.Cause(err, "musess: export keying material")
 	}
 	proof := make([]byte, serverProofLength)
 	if _, err = io.ReadFull(tlsConn, proof); err != nil {
 		tlsConn.Close()
-		return nil, E.Cause(err, "musess: read server proof")
+		return nil, false, E.Cause(err, "musess: read server proof")
 	}
 	if !sessionAuth.VerifyServerProof(proof, exporter) {
 		tlsConn.Close()
-		return nil, E.New("musess: server proof mismatch (wrong server key or secret?)")
+		return nil, false, E.New("musess: server proof mismatch (wrong server key or secret?)")
 	}
-	if err = writeRequest(tlsConn, command, destination); err != nil {
+	if !h.fecMode.enabled() {
+		// Milestone-1 wire behaviour, unchanged.
+		if err = writeRequest(tlsConn, command, destination); err != nil {
+			tlsConn.Close()
+			return nil, false, err
+		}
+		return tlsConn, false, nil
+	}
+	if err = writeRequestV2(tlsConn, command, destination, fecFlagForward|fecFlagReverse); err != nil {
 		tlsConn.Close()
-		return nil, err
+		return nil, false, err
 	}
-	return tlsConn, nil
+	var status [1]byte
+	if _, err = io.ReadFull(tlsConn, status[:]); err != nil {
+		tlsConn.Close()
+		return nil, false, E.Cause(err, "musess: read FEC status")
+	}
+	if status[0] == 0x01 {
+		h.logger.InfoContext(ctx, "musess: FEC negotiated with server for ", destination)
+		return tlsConn, true, nil
+	}
+	h.logger.InfoContext(ctx, "musess: server declined FEC, continuing without it")
+	return tlsConn, false, nil
 }
 
 func (h *Outbound) clientHandshake(ctx context.Context, rawConn net.Conn) (*utls.UConn, *ClientSessionAuth, error) {
