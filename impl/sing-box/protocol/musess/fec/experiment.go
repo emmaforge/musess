@@ -2,13 +2,14 @@ package fec
 
 import "sync"
 
-// Experiment scaffolding for the three production observations
-// flagged in impl/README.md ("Flagged production observations",
-// 2026-11-05). Everything in this file is opt-in: production
-// construction paths (NewController, Options zero values) never
-// touch it, and default behaviour is byte-for-byte the milestone-2
-// behaviour. The treatments here exist to be measured; adoption is
-// a separate decision (see the README verdicts).
+// Experiment scaffolding for the yield question of flagged
+// observation 1 (impl/README.md, "Flagged production
+// observations", 2026-11-05). Everything in this file is opt-in:
+// production construction paths (NewController) never touch it.
+// Observations 2 and 3 were adopted and landed as defaults (see
+// endpoint.go's Options); observation 1's verdict was DEFER, so
+// this file's treatments remain measurement scaffolding for the
+// saturated-lossy-link test that is still missing.
 
 // YieldPolicy parameterises expYieldWrapper, a variant of the
 // production yieldWrapper with two experimental knobs:

@@ -70,20 +70,28 @@ func newFECController(mode fecMode) fec.Controller {
 	return fec.NewController("estimator", fec.FloorForMode(mode.optionString()))
 }
 
-// applyFECExperimentFlags enables the fec package's
-// flagged-observation treatments (impl/README.md, "Flagged
-// production observations" follow-up) for end-to-end measurement.
-// Experiment scaffolding only: driven solely by the
-// MUSESS_FEC_EXP environment variable (comma list: "uo",
-// "eager"), never by configuration, and with the variable unset
-// the options are exactly the production ones.
-func applyFECExperimentFlags(options *fec.Options) {
+// applyFECEscapeHatches applies the MUSESS_FEC_EXP environment
+// variable (comma list), which since the 2026-11-05 landing only
+// *disables* adopted fec behaviours — an escape hatch for
+// measurement baselines and emergency rollback, never part of
+// normal configuration:
+//
+//	"ordered"  packet plane delivers in group order (milestone 2)
+//	"noeager"  gap accounting waits for arrival pauses (milestone 2)
+//	"nospend"  small-group spend policy off (milestone 2 pricing)
+//
+// The legacy tokens "uo" and "eager" are accepted and ignored:
+// they name what is now the production default. With the
+// variable unset the options are exactly the production ones.
+func applyFECEscapeHatches(options *fec.Options) {
 	for _, flag := range strings.Split(os.Getenv("MUSESS_FEC_EXP"), ",") {
 		switch strings.TrimSpace(flag) {
-		case "uo":
-			options.PacketOutOfOrder = true
-		case "eager":
-			options.EagerGapSynthesis = true
+		case "ordered":
+			options.PacketOrdered = true
+		case "noeager":
+			options.NoEagerGapSynthesis = true
+		case "nospend":
+			options.SpendPolicyOff = true
 		}
 	}
 }
@@ -93,7 +101,7 @@ func newFECConn(conn net.Conn, mode fecMode, packet bool, logger logger.ContextL
 	if packet {
 		options.Mode = fec.ModePacket
 	}
-	applyFECExperimentFlags(&options)
+	applyFECEscapeHatches(&options)
 	options.OnClose = func(stats fec.Stats) {
 		if logger != nil {
 			// sing's log formatter panics on float64 arguments

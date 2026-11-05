@@ -6,9 +6,11 @@ package fec
 // across arms, 3 reps, medians (ranges), sequential. The
 // exposing configuration is eager gap synthesis ON throughout:
 // without it the controller never engages at trickle and there
-// is no spend to price. Production defaults are untouched —
-// every policy lives in the Spend* Options fields or the
-// credit codec, all experiment-only. Gate: MUSESS_FEC_SPEND=1.
+// is no spend to price. The harness base pins the milestone-2
+// baseline (runTransferMod), so every policy here is still
+// opted into explicitly per arm — these benches measure the
+// candidates, not the landed defaults (landing_bench_test.go
+// covers those). Gate: MUSESS_FEC_SPEND=1.
 //
 //   MUSESS_FEC_SPEND=1 go test -run TestSpendTrickle -v ./protocol/musess/fec/
 //   MUSESS_FEC_SPEND=1 go test -run TestSpendTrickle20 -v ./protocol/musess/fec/
@@ -34,11 +36,11 @@ type spendArm struct {
 	mod   func(*Options)
 }
 
-func eagerMod(o *Options) { o.EagerGapSynthesis = true }
+func eagerMod(o *Options) { o.NoEagerGapSynthesis = false }
 
 func batchMod(k int, budget time.Duration) func(*Options) {
 	return func(o *Options) {
-		o.EagerGapSynthesis = true
+		o.NoEagerGapSynthesis = false
 		o.SpendBatchMinK = k
 		o.SpendBatchBudget = budget
 	}
@@ -46,7 +48,7 @@ func batchMod(k int, budget time.Duration) func(*Options) {
 
 func gateMod(k int, rho float64) func(*Options) {
 	return func(o *Options) {
-		o.EagerGapSynthesis = true
+		o.NoEagerGapSynthesis = false
 		o.SpendMinGroupK = k
 		o.SpendGateRho = rho
 	}
@@ -62,7 +64,7 @@ func spendArms() []spendArm {
 		{"batch k12 b130", rsCodec, batchMod(12, 130*time.Millisecond)},
 		{"gate kmin4 r.12", rsCodec, gateMod(4, 0.12)},
 		{"hybrid b8+gate8", rsCodec, func(o *Options) {
-			o.EagerGapSynthesis = true
+			o.NoEagerGapSynthesis = false
 			o.SpendBatchMinK = 8
 			o.SpendBatchBudget = 80 * time.Millisecond
 			o.SpendMinGroupK = 8
@@ -174,14 +176,14 @@ func TestSpendHybrid2(t *testing.T) {
 	const reps = 3
 	arms := []spendArm{
 		{"hybrid2 gate.12", rsCodec, func(o *Options) {
-			o.EagerGapSynthesis = true
+			o.NoEagerGapSynthesis = false
 			o.SpendBatchMinK = 8
 			o.SpendBatchBudget = 80 * time.Millisecond
 			o.SpendMinGroupK = 8
 			o.SpendGateRho = 0.12
 		}},
 		{"hybrid3 gate.15", rsCodec, func(o *Options) {
-			o.EagerGapSynthesis = true
+			o.NoEagerGapSynthesis = false
 			o.SpendBatchMinK = 8
 			o.SpendBatchBudget = 80 * time.Millisecond
 			o.SpendMinGroupK = 8
@@ -326,6 +328,10 @@ func measureHold(t *testing.T, minK int, budget time.Duration) []float64 {
 		FlushInterval:    5 * time.Millisecond,
 		FeedbackInterval: 100 * time.Millisecond,
 		GroupTimeout:     250 * time.Millisecond,
+		// The settings below are the whole policy under test:
+		// keep applyDefaults from filling the other spend
+		// fields (the landed gate would otherwise join in).
+		SpendPolicyOff:   true,
 		SpendBatchMinK:   minK,
 		SpendBatchBudget: budget,
 	}

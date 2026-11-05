@@ -71,16 +71,16 @@ import (
 // forwarder goroutine, on an absolute schedule.
 type shimConn struct {
 	net.Conn
-	mu       sync.Mutex // guards buf and the loss-model state
-	buf      []byte
-	rng      *rand.Rand
-	loss     float64
-	burst    bool // Gilbert-style: bad state drops at burstLoss
-	inBad    bool
+	mu        sync.Mutex // guards buf and the loss-model state
+	buf       []byte
+	rng       *rand.Rand
+	loss      float64
+	burst     bool // Gilbert-style: bad state drops at burstLoss
+	inBad     bool
 	burstLoss float64
-	pBad     float64 // P(good -> bad) per record
-	pGood    float64 // P(bad -> good) per record
-	service  time.Duration
+	pBad      float64 // P(good -> bad) per record
+	pGood     float64 // P(bad -> good) per record
+	service   time.Duration
 
 	queue     chan []byte
 	done      chan struct{}
@@ -241,10 +241,15 @@ func runTransfer(t *testing.T, codec Codec, ctrl Controller, loss float64, burst
 // runTransferMod is runTransfer with an optional Options modifier
 // applied to both ends before the Conns are built. It exists for
 // the flagged-observation experiments (exp_bench_test.go), which
-// need the endpoint experiment flags varied per arm. The fixed
+// need the endpoint behaviour flags varied per arm. The fixed
 // harness's accounting is unchanged: a nil modifier reproduces
 // runTransfer exactly, and every established entry point calls
-// runTransfer.
+// runTransfer. The base Options pin the milestone-2 baseline via
+// the escape hatches, so the established cells keep the meaning
+// their README tables recorded; arms opt INTO treatments (and
+// the landing spot cells in landing_bench_test.go opt into the
+// adopted production defaults) by clearing/setting fields in
+// the modifier.
 func runTransferMod(t *testing.T, codec Codec, ctrl Controller, loss float64, burst bool, offeredMbps float64, linkMbps float64, count int, size int, seed int64, mod func(*Options)) benchResult {
 	t.Helper()
 	a, b := net.Pipe()
@@ -275,6 +280,10 @@ func runTransferMod(t *testing.T, codec Codec, ctrl Controller, loss float64, bu
 		FlushInterval:    5 * time.Millisecond, // production default
 		FeedbackInterval: 100 * time.Millisecond,
 		GroupTimeout:     150 * time.Millisecond,
+		// Milestone-2 baseline (see runTransferMod's comment).
+		PacketOrdered:       true,
+		NoEagerGapSynthesis: true,
+		SpendPolicyOff:      true,
 	}
 	if mod != nil {
 		mod(&opts)

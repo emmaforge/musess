@@ -183,9 +183,9 @@ func TestExpTrickle(t *testing.T) {
 	}
 	armsAll := []arm{
 		{"ordered GT150 (production)", nil},
-		{"UO GT150", func(o *Options) { o.PacketOutOfOrder = true }},
-		{"eager GT150", func(o *Options) { o.EagerGapSynthesis = true }},
-		{"UO+eager GT150", func(o *Options) { o.PacketOutOfOrder = true; o.EagerGapSynthesis = true }},
+		{"UO GT150", func(o *Options) { o.PacketOrdered = false }},
+		{"eager GT150", func(o *Options) { o.NoEagerGapSynthesis = false }},
+		{"UO+eager GT150", func(o *Options) { o.PacketOrdered = false; o.NoEagerGapSynthesis = false }},
 	}
 	armsEst := append(append([]arm{}, armsAll...),
 		arm{"ordered GT50", gt(50 * time.Millisecond)},
@@ -242,8 +242,8 @@ func TestExpUOBulk(t *testing.T) {
 			mod   func(*Options)
 		}{
 			{"ordered", nil},
-			{"UO", func(o *Options) { o.PacketOutOfOrder = true }},
-			{"eager", func(o *Options) { o.EagerGapSynthesis = true }},
+			{"UO", func(o *Options) { o.PacketOrdered = false }},
+			{"eager", func(o *Options) { o.NoEagerGapSynthesis = false }},
 		} {
 			var rs []benchResult
 			for rep := 0; rep < reps; rep++ {

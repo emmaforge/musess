@@ -197,9 +197,10 @@ func trickleRun(t *testing.T, drop map[uint32]bool, mod func(*Options), ctrl Con
 
 // TestEndpointPacketOutOfOrder: with two early groups dropped
 // whole and arrivals continuous (never pausing past the group
-// timeout), the production ordered pump stalls behind the gap
-// for the rest of the stream, while the unordered pump delivers
-// everything that arrived.
+// timeout), the ordered pump (PacketOrdered escape hatch — the
+// milestone-2 behaviour) stalls behind the gap for the rest of
+// the stream, while the unordered pump (the landed production
+// default) delivers everything that arrived.
 func TestEndpointPacketOutOfOrder(t *testing.T) {
 	const count = 150
 	drop := map[uint32]bool{2: true, 3: true}
@@ -214,7 +215,7 @@ func TestEndpointPacketOutOfOrder(t *testing.T) {
 		}
 	}
 
-	uo, _ := trickleRun(t, drop, func(o *Options) { o.PacketOutOfOrder = true }, nil, count, 12*time.Millisecond)
+	uo, _ := trickleRun(t, drop, func(o *Options) { o.PacketOrdered = false }, nil, count, 12*time.Millisecond)
 	if len(uo) < count-12 {
 		t.Fatalf("unordered pump delivered %d/%d, want >= %d", len(uo), count, count-12)
 	}
@@ -230,12 +231,14 @@ func TestEndpointPacketOutOfOrder(t *testing.T) {
 }
 
 // TestEndpointEagerGapFeedback: with whole-group drops only
-// (groups = k=1 at trickle pacing, ~5% of groups), production
-// feedback windows are exactly 0.000 for the whole stream — the
-// sender's estimator never engages until the stream ends and
-// arrivals pause. Eager gap synthesis makes the same losses
-// visible mid-stream. Post-stream, production engages too: the
-// difference is timing, not capability.
+// (groups = k=1 at trickle pacing, ~5% of groups), pause-based
+// gap accounting (NoEagerGapSynthesis escape hatch — the
+// milestone-2 behaviour) shows feedback windows of exactly
+// 0.000 for the whole stream — the sender's estimator never
+// engages until the stream ends and arrivals pause. Eager gap
+// synthesis (the landed production default) makes the same
+// losses visible mid-stream. Post-stream, pause-based engages
+// too: the difference is timing, not capability.
 func TestEndpointEagerGapFeedback(t *testing.T) {
 	const count = 240
 	drop := map[uint32]bool{}
@@ -302,16 +305,16 @@ func TestEndpointEagerGapFeedback(t *testing.T) {
 	}
 
 	prodMid, prodPost := run(nil)
-	eagerMid, _ := run(func(o *Options) { o.EagerGapSynthesis = true })
+	eagerMid, _ := run(func(o *Options) { o.NoEagerGapSynthesis = false })
 
 	if prodMid != 0 {
-		t.Fatalf("production mid-stream redundancy = %v, want exactly 0 (feedback blindness)", prodMid)
+		t.Fatalf("pause-based mid-stream redundancy = %v, want exactly 0 (feedback blindness)", prodMid)
 	}
 	if eagerMid < 0.05 {
 		t.Fatalf("eager mid-stream redundancy = %v, want >= 0.05 (loss visible mid-stream)", eagerMid)
 	}
 	if prodPost < 0.03 {
-		t.Fatalf("production post-pause redundancy = %v, want >= 0.03 (engages only after the pause)", prodPost)
+		t.Fatalf("pause-based post-pause redundancy = %v, want >= 0.03 (engages only after the pause)", prodPost)
 	}
-	t.Logf("mid-stream redundancy: production %v, eager %v; production post-pause %v", prodMid, eagerMid, prodPost)
+	t.Logf("mid-stream redundancy: pause-based %v, eager %v; pause-based post-pause %v", prodMid, eagerMid, prodPost)
 }

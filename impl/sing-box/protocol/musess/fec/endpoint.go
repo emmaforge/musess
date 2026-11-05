@@ -11,9 +11,18 @@ import (
 )
 
 // uoActive reports whether unordered packet delivery is in
-// effect for this Conn (experiment flag, packet mode only).
+// effect for this Conn: the packet plane's defined behaviour
+// since the 2026-11-05 landing (impl/README.md, "FEC adoptions
+// landed"), unless the PacketOrdered escape hatch is set.
 func (c *Conn) uoActive() bool {
-	return c.opts.PacketOutOfOrder && c.opts.Mode == ModePacket
+	return !c.opts.PacketOrdered && c.opts.Mode == ModePacket
+}
+
+// eagerActive reports whether eager gap synthesis is in effect:
+// the receiver default since the 2026-11-05 landing, unless the
+// NoEagerGapSynthesis escape hatch is set.
+func (c *Conn) eagerActive() bool {
+	return !c.opts.NoEagerGapSynthesis
 }
 
 // Mode selects how the application payload maps to shards.
@@ -43,34 +52,58 @@ type Options struct {
 	// shaping overhead must be observable).
 	OnClose func(Stats)
 
-	// --- experiment fields (flagged observations, 2026-11-05) ---
-	// All default to the milestone-2 production behaviour; they
-	// exist so the treatments in experiment.go's README verdicts
-	// can be measured in the fixed harness and the e2e. They are
-	// measurement scaffolding, not product surface.
+	// --- adopted behaviours (landed 2026-11-05) ---
+	// The defaults below are the production behaviour whenever
+	// FEC is engaged, per the flagged-observation verdicts
+	// ratified by Emma (impl/README.md, "Flagged observations:
+	// design treatment", "Small-group spend policy" and "FEC
+	// adoptions landed"). The two booleans are escape hatches:
+	// setting one restores the milestone-2 behaviour it names,
+	// for measurement baselines and emergency rollback. They
+	// are not tuning knobs for normal operation.
 
-	// PacketOutOfOrder (packet mode only): deliver each group as
-	// soon as it resolves instead of in strict group order, so a
-	// fully-lost group no longer stalls recoverable data behind
-	// it (partial preservation, DESIGN.md 5.2). Stream mode
-	// ignores it: a byte stream cannot skip.
-	PacketOutOfOrder bool
-	// EagerGapSynthesis: declare a never-seen group lost as soon
-	// as a later group's arrival proves it (the record carrier is
+	// PacketOrdered (packet mode only) restores milestone-2
+	// in-order packet delivery: groups are handed to the
+	// consumer in strict group order, so a fully-lost group
+	// stalls recoverable data behind it until gap synthesis
+	// declares it. The zero value is the adopted behaviour:
+	// deliver each group as soon as it resolves (partial
+	// preservation, DESIGN.md 5.2), so same-destination UDP
+	// flows observe reordering around losses — legal for UDP,
+	// and the price the measurement bought a ~100x trickle
+	// latency cut with. Stream mode ignores it either way: a
+	// byte stream cannot skip.
+	PacketOrdered bool
+	// NoEagerGapSynthesis restores milestone-2 pause-based gap
+	// accounting: a never-seen group is declared lost only
+	// after arrivals pause for a full GroupTimeout. The zero
+	// value is the adopted behaviour: declare it as soon as a
+	// later group's arrival proves it (the record carrier is
 	// ordered, so a later record is proof the earlier slot's
-	// records were dropped), instead of waiting for arrivals to
-	// pause for a full GroupTimeout. This feeds feedback — and
-	// ordered delivery — mid-stream instead of after pauses.
-	EagerGapSynthesis bool
+	// records were dropped). This feeds feedback — and ordered
+	// delivery — mid-stream instead of after pauses.
+	NoEagerGapSynthesis bool
 	// GapProofGrace is how long after that proof the eager
-	// declaration waits; 0 fires at the first expiry tick. It
-	// exists for future unordered carriers (QUIC datagrams),
-	// where reordering makes instant proof unsound.
+	// declaration waits; 0 (the production value) fires at the
+	// first expiry tick. It exists for future unordered
+	// carriers (QUIC datagrams), where reordering makes
+	// instant proof unsound.
 	GapProofGrace time.Duration
 
-	// --- small-group spend policy (observation-3 companion) ---
-	// See spend.go for the analysis. All zero = off.
+	// --- small-group spend policy (observation-3 companion,
+	// landed 2026-11-05 as the composed policy) ---
+	// See spend.go for the analysis. Zero fields are filled by
+	// applyDefaults with the measured production values
+	// (batch MinK 8 / budget 80 ms, gate MinK 8, boundary
+	// SpendGateRho = MaxRedundancy) unless SpendPolicyOff is
+	// set; SpendPolicyOff is the escape hatch that restores
+	// milestone-2 per-group parity pricing exactly.
 
+	// SpendPolicyOff disables the small-group spend policy:
+	// no batching hold, no emit gate — every protected group
+	// buys its full ParityFor parity at emit time, as in
+	// milestone 2.
+	SpendPolicyOff bool
 	// SpendBatchMinK / SpendBatchBudget (packet mode only):
 	// while a protected group (its redundancy target > 0) is
 	// smaller than SpendBatchMinK, the flush timer holds it —
@@ -89,8 +122,8 @@ type Options struct {
 	// utilisation justifies its 1/k price). SpendGateRho also
 	// serves as the batching hold's disengage threshold (see
 	// holdForBatch): the two together define one regime
-	// boundary — batch and gate below it, today's full-parity
-	// small groups at or above it.
+	// boundary — batch and gate below it, full-parity small
+	// groups at or above it.
 	SpendMinGroupK int
 	SpendGateRho   float64
 }
@@ -111,11 +144,139 @@ func (o *Options) applyDefaults() {
 	if o.SaturationBytes <= 0 {
 		o.SaturationBytes = 256 * 1024
 	}
+	// Composed small-group spend policy (landed 2026-11-05,
+	// measured values from impl/README.md "Small-group spend
+	// policy"): batch toward k>=8 under an 80 ms budget while
+	// the target is below the boundary; groups still below
+	// k=8 at budget expiry ride raw below the boundary (emit
+	// gate); at or above the boundary, milestone-2 behaviour.
+	// The boundary is the redundancy cap itself (0.15 measured
+	// quiet; 0.12 measured chattery). A persistence-qualified
+	// boundary (target pinned at the cap for N consecutive
+	// windows) was designed but NOT measured — future work,
+	// deliberately not invented here.
+	if !o.SpendPolicyOff {
+		if o.SpendBatchMinK <= 0 {
+			o.SpendBatchMinK = 8
+		}
+		if o.SpendBatchBudget <= 0 {
+			o.SpendBatchBudget = 80 * time.Millisecond
+		}
+		if o.SpendMinGroupK <= 0 {
+			o.SpendMinGroupK = 8
+		}
+		if o.SpendGateRho <= 0 {
+			o.SpendGateRho = MaxRedundancy
+		}
+	}
 }
 
 // rawChunkSize is the payload size of raw (ungrouped) records used
 // in stream mode while redundancy is zero: header cost ~0.03%.
 const rawChunkSize = 32768
+
+// uoWindowBits is the size of the unordered-delivery window:
+// the delivered-set bookkeeping for the packet plane is a
+// sliding-window bitmap of this many group IDs anchored at the
+// delivery cursor (deliverNext), replacing the experiment
+// prototype's ever-growing map (whose size was proportional to
+// connection lifetime). Storage is constant: uoWindowBits/8 =
+// 512 bytes per Conn, however long the connection runs.
+//
+// The window also caps how far delivery may run ahead of the
+// accounting cursor. That lead is what gap synthesis bounds in
+// practice — with eager synthesis (the default) a fully-lost
+// cursor group is declared within an expiry tick, so the lead
+// stays at a handful of groups; 4096 is three orders of
+// magnitude of headroom. If the lead ever did reach the window
+// edge (eager synthesis disabled by escape hatch, arrivals
+// never pausing, cursor group fully lost), the pump stops
+// delivering and the send side backpressures — bounded memory
+// is traded for milestone-2-style stall, never for unbounded
+// bookkeeping. At receive finish the cap is lifted (uoFinal):
+// the record stream has ended, pending is finite, and no late
+// record can arrive to need the marks.
+const uoWindowBits = 4096
+
+// deliveredWindow is the bounded delivered-set: bit i records
+// that group cursor+i has been handed to the consumer out of
+// order. Bits are only ever dropped by advancing the cursor
+// past them (advance), at which point the cursor guard
+// (group < deliverNext) takes over stale-record duty for that
+// ID, so a mark never needs to outlive its window slot.
+type deliveredWindow struct {
+	bits []uint64
+}
+
+func newDeliveredWindow() *deliveredWindow {
+	return &deliveredWindow{bits: make([]uint64, uoWindowBits/64)}
+}
+
+// sizeBytes reports the window's storage (test introspection:
+// the bound proof asserts it never changes).
+func (w *deliveredWindow) sizeBytes() int { return len(w.bits) * 8 }
+
+// contains reports whether id has been delivered. IDs below the
+// cursor count as delivered (they have been passed); IDs at or
+// beyond the window edge report false — the pump's lead cap
+// guarantees nothing out there has been delivered yet.
+func (w *deliveredWindow) contains(id, cursor uint32) bool {
+	if id < cursor {
+		return true
+	}
+	d := id - cursor
+	if d >= uoWindowBits {
+		return false
+	}
+	return w.bits[d/64]>>(d%64)&1 == 1
+}
+
+// mark records id as delivered. It refuses IDs at or beyond
+// the window edge (returns false); the pump checks the lead
+// cap before delivering, so a refusal can only occur on the
+// final drain, where marks no longer matter.
+func (w *deliveredWindow) mark(id, cursor uint32) bool {
+	if id < cursor {
+		return true
+	}
+	d := id - cursor
+	if d >= uoWindowBits {
+		return false
+	}
+	w.bits[d/64] |= 1 << (d % 64)
+	return true
+}
+
+// advance returns how many consecutive delivered groups the
+// cursor can move past from its current position, shifting the
+// window so bit 0 always corresponds to the (new) cursor.
+func (w *deliveredWindow) advance() int {
+	run := 0
+	for run < uoWindowBits && w.bits[run/64]>>(uint(run)%64)&1 == 1 {
+		run++
+	}
+	if run > 0 {
+		w.shiftLeft(run)
+	}
+	return run
+}
+
+// shiftLeft moves every bit down by n positions (bit i takes
+// the value of bit i+n); vacated high bits are zeroed.
+func (w *deliveredWindow) shiftLeft(n int) {
+	words := n / 64
+	bits := uint(n % 64)
+	for i := 0; i < len(w.bits); i++ {
+		var v uint64
+		if i+words < len(w.bits) {
+			v = w.bits[i+words] >> bits
+			if bits > 0 && i+words+1 < len(w.bits) {
+				v |= w.bits[i+words+1] << (64 - bits)
+			}
+		}
+		w.bits[i] = v
+	}
+}
 
 // Stats is the per-connection accounting used for the shaping
 // budget (DESIGN.md 5.4): overhead = (HeaderBytes + ParityBytes) /
@@ -180,12 +341,16 @@ type Conn struct {
 	readErr      error
 	readBuf      []byte
 
-	// Experiment state (only touched when the matching Options
-	// flag is on): uoDelivered tracks groups already handed to
-	// the consumer out of order, feeding the stale-record guard;
-	// gapProof* records when a later group first proved the
-	// cursor group never arrived.
-	uoDelivered  map[uint32]bool
+	// Unordered-delivery state (packet mode, unless the
+	// PacketOrdered escape hatch is set): uoDelivered is the
+	// bounded sliding-window set of groups already handed to
+	// the consumer out of order, feeding the stale-record
+	// guard; uoFinal lifts the pump's lead cap during the
+	// receive-finish drain. gapProof* records when a later
+	// group first proved the cursor group never arrived
+	// (eager gap synthesis).
+	uoDelivered  *deliveredWindow
+	uoFinal      bool
 	gapProofSet  bool
 	gapProofFor  uint32
 	gapProofTime time.Time
@@ -225,7 +390,7 @@ func NewConn(conn net.Conn, codec Codec, ctrl Controller, opts Options) *Conn {
 		pending:    make(map[uint32]*groupResult),
 	}
 	if c.uoActive() {
-		c.uoDelivered = make(map[uint32]bool)
+		c.uoDelivered = newDeliveredWindow()
 	}
 	go c.sendLoop()
 	go c.recvLoop()
@@ -373,12 +538,12 @@ func (c *Conn) sendLoop() {
 		// not the planned size: partial groups at flush boundaries
 		// must not inherit a full group's parity bill.
 		k, r := len(group), c.codec.ParityFor(len(group), groupRho)
-		// Small-group spend gate (experiment): a group smaller
-		// than SpendMinGroupK buys no parity unless the target
-		// redundancy says loss is high — at small k one parity
-		// shard costs 1/k of the group, and at low targets its
-		// expected utilisation does not pay that price
-		// (see spend.go).
+		// Small-group spend gate (composed spend policy): a
+		// group smaller than SpendMinGroupK buys no parity
+		// unless the target redundancy says loss is high — at
+		// small k one parity shard costs 1/k of the group, and
+		// at low targets its expected utilisation does not pay
+		// that price (see spend.go).
 		if r > 0 && c.opts.SpendMinGroupK > 0 && k < c.opts.SpendMinGroupK && groupRho < c.opts.SpendGateRho {
 			r = 0
 		}
@@ -450,7 +615,7 @@ func (c *Conn) sendLoop() {
 		case <-flushTimer.C:
 			timerArmed = false
 			if c.holdForBatch(len(group), groupRho, groupStart) {
-				// Batching hold (experiment): re-check after one
+				// Batching hold (composed spend policy): re-check after one
 				// more flush interval — arrivals may complete the
 				// group sooner (the emit-on-full path above is
 				// unaffected), and the budget check bounds the
@@ -496,7 +661,7 @@ func (c *Conn) sendLoop() {
 
 // holdForBatch reports whether the flush timer should hold the
 // current group instead of emitting it, under the small-group
-// batching experiment (spend.go): the group is protected
+// batching policy (spend.go): the group is protected
 // (rho > 0 — there is a parity spend to amortise), still smaller
 // than SpendBatchMinK, and younger than SpendBatchBudget.
 // Packet mode only: interactive flows are the packet plane, and
@@ -611,20 +776,20 @@ func (c *Conn) handleShardRecord(rec record) {
 	if _, resolved := c.pending[rec.group]; resolved {
 		return
 	}
-	if c.uoActive() && c.uoDelivered[rec.group] {
+	if c.uoActive() && c.uoDelivered.contains(rec.group, c.deliverNext) {
 		return
 	}
 	if rec.group > c.maxGroupSeen {
 		c.maxGroupSeen = rec.group
 		c.maxGroupTime = time.Now()
 	}
-	// Eager gap proof (experiment): on this ordered carrier, a
-	// record of a later group proves the cursor group's records
-	// were all dropped if that group has no trace anywhere.
-	// Record when the proof was first observed; the expiry loop
-	// turns it into a lost-group declaration without waiting
-	// for an arrival pause.
-	if c.opts.EagerGapSynthesis && c.deliverNext < rec.group {
+	// Eager gap proof: on this ordered carrier, a record of a
+	// later group proves the cursor group's records were all
+	// dropped if that group has no trace anywhere. Record when
+	// the proof was first observed; the expiry loop turns it
+	// into a lost-group declaration without waiting for an
+	// arrival pause.
+	if c.eagerActive() && c.deliverNext < rec.group {
 		if _, ok := c.recvGroups[c.deliverNext]; !ok {
 			if !c.gapProofSet || c.gapProofFor != c.deliverNext {
 				c.gapProofSet = true
@@ -770,12 +935,12 @@ func (c *Conn) resolveLocked(id uint32, g *recvGroup) {
 // is slow: that backpressure is intended, but it must not hold
 // recvMu while blocked, so this is only called with results
 // ready and a buffered channel; if the channel is full we return
-// and retry on the next event. With the PacketOutOfOrder
-// experiment flag the packet-mode variant runs instead: every
-// resolved group is delivered as soon as it resolves, in
-// resolution order, and deliverNext degrades to a pure
-// accounting cursor (gap synthesis still walks it so fully-lost
-// groups are accounted exactly once).
+// and retry on the next event. In unordered packet mode the
+// packet-mode variant runs instead: every resolved group is
+// delivered as soon as it resolves, in group-ID order, and
+// deliverNext degrades to a pure accounting cursor (gap
+// synthesis still walks it so fully-lost groups are accounted
+// exactly once).
 func (c *Conn) pumpDeliverLocked() {
 	if c.recvFinished {
 		return
@@ -806,11 +971,15 @@ func (c *Conn) pumpDeliverLocked() {
 	}
 }
 
-// pumpDeliverUOLocked is the unordered packet-mode pump
-// (experiment): deliver every resolved group now, lowest ID first
-// for determinism, regardless of gaps at the cursor. Feedback
-// accounting is unaffected — it happens in resolveLocked when a
-// group resolves, not here. Caller holds recvMu.
+// pumpDeliverUOLocked is the unordered packet-mode pump:
+// deliver every resolved group now, lowest ID first for
+// determinism, regardless of gaps at the cursor — subject to
+// the delivered-window lead cap (see uoWindowBits): a group
+// may not be delivered further than the window ahead of the
+// accounting cursor, because its delivered mark would have no
+// slot. Feedback accounting is unaffected — it happens in
+// resolveLocked when a group resolves, not here. Caller holds
+// recvMu.
 func (c *Conn) pumpDeliverUOLocked() {
 	ids := make([]uint32, 0, len(c.pending))
 	for id := range c.pending {
@@ -819,6 +988,13 @@ func (c *Conn) pumpDeliverUOLocked() {
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	for _, id := range ids {
 		res := c.pending[id]
+		if res.delivered == 0 && !c.uoFinal && id >= c.deliverNext && id-c.deliverNext >= uoWindowBits {
+			// Ascending order: every later group is at least
+			// as far ahead. Leave this and the rest pending;
+			// the cursor catches up via gap synthesis, and
+			// delivery resumes on the next pump.
+			break
+		}
 		for res.delivered < len(res.messages) {
 			select {
 			case c.delivered <- res.messages[res.delivered]:
@@ -830,7 +1006,7 @@ func (c *Conn) pumpDeliverUOLocked() {
 			}
 		}
 		delete(c.pending, id)
-		c.uoDelivered[id] = true
+		c.uoDelivered.mark(id, c.deliverNext)
 	}
 	c.advanceCursorUOLocked()
 }
@@ -840,9 +1016,7 @@ func (c *Conn) pumpDeliverUOLocked() {
 // synthesises slots nobody has accounted for. Caller holds
 // recvMu.
 func (c *Conn) advanceCursorUOLocked() {
-	for c.uoDelivered[c.deliverNext] {
-		c.deliverNext++
-	}
+	c.deliverNext += uint32(c.uoDelivered.advance())
 }
 
 // synthesiseGapLocked declares the cursor group fully lost
@@ -881,7 +1055,7 @@ func (c *Conn) expiryLoop() {
 			// a full timeout to arrive, declare it lost (counted
 			// as one unit: exact for raw groups, a floor for fully
 			// lost shard groups, which need every record dropped).
-			// The EagerGapSynthesis experiment adds a second trigger:
+			// Eager gap synthesis adds a second trigger:
 			// a later group's arrival already proved this slot lost
 			// (ordered carrier), so declare it once the proof is
 			// older than GapProofGrace — no arrival pause needed.
@@ -900,13 +1074,13 @@ func (c *Conn) expiryLoop() {
 				// proof now (grace restarts — conservative) so one
 				// tick clears the whole run of gaps instead of one
 				// gap per tick.
-				if c.opts.EagerGapSynthesis &&
+				if c.eagerActive() &&
 					(!c.gapProofSet || c.gapProofFor != c.deliverNext) {
 					c.gapProofSet = true
 					c.gapProofFor = c.deliverNext
 					c.gapProofTime = now
 				}
-				eager := c.opts.EagerGapSynthesis && c.gapProofSet &&
+				eager := c.eagerActive() && c.gapProofSet &&
 					c.gapProofFor == c.deliverNext &&
 					now.Sub(c.gapProofTime) >= c.opts.GapProofGrace
 				if !eager && now.Sub(c.maxGroupTime) <= c.opts.GroupTimeout {
@@ -935,6 +1109,11 @@ func (c *Conn) finishReceive(err error) {
 	for id, g := range c.recvGroups {
 		c.resolveLocked(id, g)
 	}
+	// Final drain: the record stream has ended, so lift the
+	// unordered pump's lead cap — pending is finite and no late
+	// record can arrive to need delivered marks for the groups
+	// still queued behind a cursor gap.
+	c.uoFinal = true
 	c.pumpDeliverLocked()
 	c.recvFinished = true
 	if c.readErr == nil {

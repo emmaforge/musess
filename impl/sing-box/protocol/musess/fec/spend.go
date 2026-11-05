@@ -2,12 +2,17 @@ package fec
 
 import "sync"
 
-// Small-group spend policy — experiment scaffolding for the
-// deferred companion of flagged observation 3 (impl/README.md,
-// "Flagged observations: design treatment"). Everything here is
-// opt-in via the Spend* Options fields or the wrapper codec
-// below; production construction paths never set them, and the
-// zero values reproduce milestone-2 behaviour exactly.
+// Small-group spend policy — the deferred companion of flagged
+// observation 3 (impl/README.md, "Flagged observations: design
+// treatment"). Status since the 2026-11-05 landing: the
+// batching + gate composition prototyped in endpoint.go is the
+// production default whenever FEC is engaged (applyDefaults
+// fills the Spend* fields with the measured values; the
+// SpendPolicyOff Options field is the milestone-2 escape
+// hatch). The credit codec below remains experiment-only: it
+// was measured and rejected (see "Small-group spend policy" in
+// the README), and is kept so the falsification stays
+// reproducible.
 //
 // The problem, in numbers: parity is priced per group —
 // ParityFor(k, rho) charges at least one whole parity shard for

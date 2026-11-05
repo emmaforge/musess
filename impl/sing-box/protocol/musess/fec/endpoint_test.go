@@ -73,7 +73,27 @@ func testOptions(mode Mode) Options {
 		FlushInterval:    2 * time.Millisecond,
 		FeedbackInterval: 50 * time.Millisecond,
 		GroupTimeout:     100 * time.Millisecond,
+		// Pin milestone-2 semantics: these tests exercise
+		// mechanisms (codecs, grouping, recovery, feedback),
+		// not the adopted policy defaults landed 2026-11-05.
+		// Tests for the defaults themselves live in
+		// landing_test.go and use productionOptions.
+		PacketOrdered:       true,
+		NoEagerGapSynthesis: true,
+		SpendPolicyOff:      true,
 	}
+}
+
+// productionOptions is testOptions WITHOUT the milestone-2
+// escape hatches: the adopted production defaults (unordered
+// packet delivery, eager gap synthesis, composed spend policy)
+// exactly as the musess wiring constructs them.
+func productionOptions(mode Mode) Options {
+	opts := testOptions(mode)
+	opts.PacketOrdered = false
+	opts.NoEagerGapSynthesis = false
+	opts.SpendPolicyOff = false
+	return opts
 }
 
 func TestEndpointStreamNoLoss(t *testing.T) {

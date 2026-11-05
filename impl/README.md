@@ -1072,7 +1072,14 @@ treatments live behind `fec.NewControllerWithYieldPolicy`,
 the `Options` experiment fields (`PacketOutOfOrder`,
 `EagerGapSynthesis`, `GapProofGrace`), and — for e2e only —
 the `MUSESS_FEC_EXP` environment variable read in
-`fecwire.go` (unset = production options exactly). As a
+`fecwire.go` (unset = production options exactly).
+**Superseded in part by "FEC adoptions landed" below:**
+Emma ratified the observation-2 and observation-3
+verdicts, and unordered packet delivery, eager gap
+synthesis and the composed spend policy are now the
+production defaults when FEC is engaged (the field names
+above have since become escape hatches); observation 1's
+defer verdict stands. As a
 behaviour-neutral check on the endpoint refactor this work
 required, today's production arms reproduce the harness-fix
 tables almost exactly (bulk rs+estimator at 5%: delivery
@@ -1593,6 +1600,141 @@ credit codec), `spend_test.go`, `spend_bench_test.go`
 `TestSpendBulk`, `TestSpendTraces`, `TestSpendHoldWire`),
 the `Spend*` fields + emit gate + flush hold in
 `endpoint.go`. Bench logs: `.tmp/spend/`.
+
+### FEC adoptions landed (2026-11-05)
+
+Emma ratified both adoption recommendations (unordered
+packet delivery; eager gap synthesis together with its
+small-group spend companion). They are now the production
+defaults **whenever FEC is engaged**. FEC itself is
+unchanged at the option surface: still default-off, opt-in
+off/auto/on — nothing in this landing turns FEC on for
+anyone who did not ask for it.
+
+What became default, in `protocol/musess/fec/endpoint.go`:
+
+- **Unordered packet delivery** is the packet/UDP plane's
+  defined behaviour: `Options.PacketOrdered` is now an
+  escape hatch that restores milestone-2 in-order delivery.
+  Stream mode is untouched (ordered, accept-and-document,
+  as the observation-2 verdict recorded).
+- **Eager gap synthesis** is the receiver default on both
+  planes: `Options.NoEagerGapSynthesis` is the escape hatch
+  that restores milestone-2 pause-based accounting.
+  `GapProofGrace` stays 0, as measured.
+- **The composed spend policy** is filled by
+  `applyDefaults` exactly as measured (hybrid3): batch
+  toward k≥8 under an 80 ms budget while the controller
+  target is below the boundary; groups still below k=8 at
+  budget expiry ride raw below the boundary (emit gate);
+  at/above the boundary, milestone-2 full-parity small
+  groups. The boundary is `MaxRedundancy` (0.15, the
+  measured-quiet value; 0.12 measured chattery).
+  `Options.SpendPolicyOff` is the escape hatch.
+  **The persistence-qualified boundary refinement was
+  designed but NOT measured, and is deliberately not in
+  this landing** — it remains future work, recorded in the
+  spend section above.
+- The `MUSESS_FEC_EXP` environment variable in `fecwire.go`
+  changed meaning: it used to opt INTO the treatments
+  ("uo", "eager" — now accepted and ignored, they name the
+  defaults); it now only opts OUT ("ordered", "noeager",
+  "nospend") for measurement baselines and rollback.
+  Production construction (`newFECConn`) sets no behaviour
+  fields at all — the defaults live in the fec package, so
+  the harness and the binary cannot drift apart.
+- The yield wrapper is **unchanged**: observation 1's
+  loss-aware floor stays out (verdict: defer, pending a
+  saturated-and-lossy test this rig cannot provide), and
+  the mux work is untouched.
+
+**Bounded delivered-set (the landing prerequisite).** The
+prototype's `uoDelivered` map grew by one entry per group
+for the connection's whole life. It is replaced by
+`deliveredWindow`: a 4096-bit (512-byte) sliding bitmap
+anchored at the delivery cursor. Bit i records that group
+cursor+i has been handed to the consumer; advancing the
+cursor shifts the window, and once the cursor passes an ID
+the pre-existing `group < deliverNext` stale-record guard
+covers it, so no mark needs to outlive its slot. The window
+also caps the pump's lead over the accounting cursor at
+4096 groups — three orders of magnitude beyond what eager
+gap synthesis ever lets accumulate (a fully-lost cursor
+group is declared within an expiry tick). If the lead ever
+did reach the edge (eager synthesis escape-hatched off,
+arrivals never pausing, cursor group fully lost), the pump
+stops and the send side backpressures: bounded memory is
+traded for a milestone-2-style stall, never for unbounded
+bookkeeping. At receive finish the cap is lifted
+(`uoFinal`): the record stream has ended, pending is
+finite, and no late record can arrive to need the marks.
+Proof: `TestDeliveredWindowBoundLongStream` drives 100,000
+messages (6,250 groups — more than the window holds) over
+production-default Conns with deterministic record loss:
+every surviving message delivered exactly once (no
+duplicates, exact set), accounting cursor caught up to
+6,250, delivered-set storage exactly 512 bytes at the end.
+`TestDeliveredWindowMechanics` pins mark/contains/advance
+across word boundaries; `TestProductionOptionDefaults`
+pins the default profile and the escape hatches.
+
+**Spot cells** (`landing_bench_test.go`, gate
+`MUSESS_FEC_LAND=1`; the harness base pins milestone-2 and
+the cells clear the escape hatches, i.e. they run the exact
+production profile). Prototype references in brackets:
+
+| cell | delivery | goodput | p50 | overhead |
+|---|---|---|---|---|
+| trickle 5%, rs+estimator | 97.00% [97.33] | 0.85 [0.85] | 126 ms [124] | 11.31% [10.77] |
+| trickle 5%, no FEC (static 0) | 94.33% [94.33] | 0.90 | 14.8 ms [14.7] | 0.83% |
+| bulk 5% | 97.28% [97.15–97.30] | 8.18 | — | 7.33% |
+| bulk 10% | 93.23% [92.90–93.60] | 8.17 | — | 9.26% |
+| bulk 20% | 82.23% [81.73–82.33] | 7.69 | — | 10.06% |
+
+The trickle spend row is the first measurement of the full
+production composition (UO + eager + spend): the spend
+benches ran ordered + eager, and their record listed this
+composition as unmeasured. It lands inside the prototype's
+ranges on every metric; the +0.54pt overhead delta against
+hybrid3's single median is within the run-to-run spread
+the hybrid arms themselves showed (hybrid2 produced two
+median sets 2.85pt apart across repeat runs). The bulk
+rows sit inside the spend-bench neighbourhood at every
+loss, as required — no bulk regression.
+
+**One by-construction exposure, flagged honestly:** the
+emit gate's mechanics were never mode-scoped in the
+prototype, and the spend cells measured the packet plane
+only — so as landed, the gate also applies to the stream
+plane's sub-k8 flush-tail groups at sub-boundary targets
+(the batching hold remains packet-only, as coded and as
+measured). The stream exposure is bounded (planned stream
+groups are k=16; only flush tails are smaller) and both
+e2e suites pass with it live, but no harness cell prices
+it: stream-plane spend measurement joins the
+persistence-qualified boundary on the future-work list.
+
+**Regression gates for this landing:** `go vet` clean
+(fec, musess, option); full fec unit tests pass under
+`-race`, including the three new landing tests and all
+pre-existing tests (mechanism tests now pin milestone-2
+semantics via the escape hatches in `testOptions` and the
+harness base); musess unit tests pass. FEC e2e
+(`test/run-e2e-fec.sh`) **6/6** on the rebuilt binary —
+with the new defaults live in both planes (f3's UDP probe
+crosses the packet plane; f1/f5 cross the stream plane).
+Milestone-1 e2e **5 passed, 1 failed — the established
+profile** (check (d), sandbox UDP EPERM, with the
+pre-existing stock panic in that teardown). Files:
+`endpoint.go` (defaults, escape hatches, delivered window,
+pump lead cap), `fecwire.go` (escape-hatch env semantics),
+`spend.go` / `experiment.go` (status comments),
+`landing_test.go`, `landing_bench_test.go`, and
+escape-hatch updates in `endpoint_test.go`, `bench_test.go`,
+`exp_bench_test.go`, `spend_bench_test.go`,
+`experiment_test.go`. Still experiment-only: the yield
+policy (`experiment.go`), the credit codec (`spend.go`),
+and every gated bench.
 
 ## Overhead vs the ≤8% shaping budget (DESIGN.md 5.4)
 
