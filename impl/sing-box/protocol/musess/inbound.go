@@ -81,7 +81,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		certificate:  certificate,
 		replay:       newReplayCache(),
 		fecMode:      mode,
-		earlyRequest: options.EarlyRequest,
+		earlyRequest: options.EarlyRequestEnabled(),
 	}
 	for _, user := range options.Users {
 		inbound.users = append(inbound.users, makeUserEntry(user.Name, user.UUID, user.Secret))

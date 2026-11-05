@@ -66,7 +66,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		uuid:         options.UUID,
 		secret:       options.Secret,
 		fecMode:      mode,
-		earlyRequest: options.EarlyRequest,
+		earlyRequest: options.EarlyRequestEnabled(),
 	}, nil
 }
 

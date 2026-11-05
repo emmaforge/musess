@@ -1,5 +1,15 @@
 package option
 
+// earlyRequestEnabled resolves the tri-state early_request option
+// shared by both musess peers: unset (nil) and explicit true both
+// enable the feature; only an explicit false disables it. The
+// default flipped to on when Emma ratified the rate-attack phase-2
+// defaults recommendation (2026-11-05); see
+// MusessInboundOptions.EarlyRequest for the rollout rule.
+func earlyRequestEnabled(value *bool) bool {
+	return value == nil || *value
+}
+
 type MusessInboundOptions struct {
 	ListenOptions
 	// Dest is the borrowed destination site's domain name. Authenticated
@@ -35,11 +45,22 @@ type MusessInboundOptions struct {
 	// immediately after the TLS handshake, instead of waiting one
 	// flight for the server proof first, saving one leg RTT of
 	// connection-setup latency. Authenticated path only; the
-	// unauthenticated fallback is untouched. On the server side
-	// enabling it is safe with any client (the proof keeps the
-	// stock order and plain requests are still accepted); a
-	// client must only enable it when the server does.
-	EarlyRequest bool `json:"early_request,omitempty"`
+	// unauthenticated fallback is untouched.
+	//
+	// Tri-state, DEFAULT ON (ratified 2026-11-05): unset and true
+	// enable it, only an explicit false disables it. On the server
+	// side enabling it is safe with any client (the proof keeps
+	// the stock order and plain requests are still accepted); a
+	// client with it enabled against a server that has it disabled
+	// fails cleanly after authentication. Rollout rule: deploy
+	// servers first, then clients.
+	EarlyRequest *bool `json:"early_request,omitempty"`
+}
+
+// EarlyRequestEnabled resolves the tri-state EarlyRequest option
+// for the inbound: unset and true mean on, explicit false means off.
+func (o MusessInboundOptions) EarlyRequestEnabled() bool {
+	return earlyRequestEnabled(o.EarlyRequest)
 }
 
 type MusessUser struct {
@@ -62,7 +83,14 @@ type MusessOutboundOptions struct {
 	// when set to "auto" or "on"; the server may decline, in which
 	// case the connection runs without it.
 	FEC string `json:"fec,omitempty"`
-	// EarlyRequest: see MusessInboundOptions.EarlyRequest. Enable
-	// only when the server enables it too.
-	EarlyRequest bool `json:"early_request,omitempty"`
+	// EarlyRequest: see MusessInboundOptions.EarlyRequest.
+	// Tri-state, default on; set false only for servers known to
+	// have it disabled.
+	EarlyRequest *bool `json:"early_request,omitempty"`
+}
+
+// EarlyRequestEnabled resolves the tri-state EarlyRequest option
+// for the outbound: unset and true mean on, explicit false means off.
+func (o MusessOutboundOptions) EarlyRequestEnabled() bool {
+	return earlyRequestEnabled(o.EarlyRequest)
 }

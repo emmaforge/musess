@@ -1922,8 +1922,10 @@ plus one new unit-test file (`early_request_test.go`, 6 tests:
 sealed round-trip for v1 and v2 headers, tampered ciphertext /
 nonce / tag / wrong-key rejection, plain-header passthrough for
 mixed peers, stock reader rejecting a sealed header, stream
-boundary and nonce randomness). Still behind the
-`early_request` option, default off.
+boundary and nonce randomness). Landed behind the
+`early_request` option, default off at landing time; the
+default was flipped to on by the follow-up in section 4
+("Outcome"), ratified 2026-11-05.
 
 **One deliberate deviation from the experiment, forced by a
 test the brief required.** The experiment's server read the
@@ -2110,6 +2112,49 @@ composition, and a record-shape comparison exist.
 **combo**: no separate decision — where mux is enabled,
 early_request should be enabled with it (it only accelerates
 the session's own establishment).
+
+**Outcome (2026-11-05): both recommendations RATIFIED by Emma
+as written.** early_request is now **default ON** on both
+peers; mux stays an opt-in experiment-tree prototype, default
+off, not promoted. The flip is a schema change only — no wire
+behaviour changed in any peer combination:
+
+- The option is now tri-state: `early_request` is a `*bool`
+  on both option structs, resolved by `EarlyRequestEnabled()`
+  (unset and explicit true = on; only an explicit false =
+  off). This follows the tree's established default-on pattern
+  (`UDPFragment *bool` + consumption-site default): the
+  `badoption.Bool` type guessed above does not exist in this
+  tree's sing version (v0.8.2), whose badoption package has no
+  boolean type. The JSON field name is unchanged, and an unset
+  option still marshals to no field, so existing configs are
+  untouched byte for byte.
+- Rollout rule, now recorded on the option itself: **deploy
+  servers first, then clients.** A server with the feature on
+  accepts stock and early clients alike (proof-first order);
+  a client with it on against a server with it explicitly off
+  fails cleanly after authentication ("unsupported framing
+  version", post-auth close) — never forwarded, never treated
+  as unauthenticated.
+- Verification of the flipped tree: `go vet` clean; the six
+  landing unit tests pass unchanged, plus three new ones
+  (`early_request_option_test.go`: tri-state resolution for
+  both peers through the real config-parse path, marshal
+  stability of unset vs explicit-false, and the full
+  3-state x 3-state client/server combination matrix at the
+  framing level — every combination succeeds except
+  client-on x server-off, which rejects cleanly). Milestone-1
+  e2e with configs that **omit** `early_request` entirely:
+  the established 5-pass / 1-sandbox-fail profile, and a
+  phase-2-shaped TTFB spot check (1 MiB raw-TCP through the
+  delay shim at 100 ms/dir, 3 reps) puts the omitted-config
+  pair in the early class — median 0.457 s vs 0.640 s for the
+  same pair with explicit `"early_request": false` on both
+  peers (phase-2 reference: early 0.410 / stock 0.611). The
+  explicit-false milestone-1 e2e reproduces the old 5/1
+  profile exactly. FEC e2e with the option omitted (so early
+  now composes with FEC by default): **6/6**, matching the
+  phase-2 explicit-on run.
 
 ## What remains unverified
 
