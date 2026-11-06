@@ -115,9 +115,6 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 // handshake state exposes; that private key doubles as the musess
 // auth ephemeral, binding the auth tag to the very key exchange that
 // becomes the TLS session.
-// dialStream establishes one authenticated musess TLS connection
-// and sends the request header. It returns the raw TLS connection
-// and whether FEC was negotiated (v2 header + server status byte).
 func (h *Outbound) dialStream(ctx context.Context, command byte, destination M.Socksaddr) (net.Conn, bool, error) {
 	rawConn, err := h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
 	if err != nil {

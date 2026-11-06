@@ -142,7 +142,10 @@ func (c *fecPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 		return M.Socksaddr{}, err
 	}
 	length := int(lengthBytes[0])<<8 | int(lengthBytes[1])
-	buffer.Reset()
+	// Same headroom contract as streamPacketConn.ReadPacket: do NOT
+	// Reset() the buffer, it would destroy the front headroom reserved
+	// for the destination's WritePacket. Truncate(0) preserves start.
+	buffer.Truncate(0)
 	if _, err = io.CopyN(buffer, reader, int64(length)); err != nil {
 		return M.Socksaddr{}, err
 	}

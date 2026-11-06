@@ -1728,6 +1728,18 @@ profile** (check (d), sandbox UDP EPERM, with the
 pre-existing stock panic in that teardown). Files:
 `endpoint.go` (defaults, escape hatches, delivered window,
 pump lead cap), `fecwire.go` (escape-hatch env semantics),
+
+> **Correction 2026-11-06:** the "pre-existing stock panic" attribution
+> above is wrong. The `buffer overflow` panic in the e2e UDP teardown
+> was caused by musess itself: `streamPacketConn.ReadPacket`
+> (`framing.go`) and `fecPacketConn.ReadPacket` (`fecwire.go`) called
+> `buffer.Reset()`, destroying the front headroom the packet-copy path
+> reserves for the destination's `ExtendHeader` (10 bytes for an IPv4
+> SOCKS destination — exactly the panic's "need 10"). Fixed by
+> `Truncate(0)` in both places, with regression tests in
+> `headroom_test.go` (verified to fail on the old code, pass on the
+> fix). After the fix the panic is gone and check (d) fails only on the
+> sandbox UDP EPERM, as documented below.
 `spend.go` / `experiment.go` (status comments),
 `landing_test.go`, `landing_bench_test.go`, and
 escape-hatch updates in `endpoint_test.go`, `bench_test.go`,
@@ -1765,6 +1777,13 @@ the same yardstick, honestly:
   panic in the stock copy stack during that teardown (verified
   byte-identical panic line in milestone 1's own recorded final
   run, `.tmp/e2e-final-run.txt`) — not a milestone-2 regression.
+  [Correction 2026-11-06: the panic is not pre-existing stock and not
+  "not a regression" in the sense claimed — it is a musess bug
+  (`buffer.Reset()` in both packet-conn `ReadPacket` implementations
+  destroying reserved front headroom), fixed 2026-11-06 by
+  `Truncate(0)` + `headroom_test.go`. The EPERM part of the sentence
+  stands: after the fix, check (d) still fails only on the sandbox
+  UDP EPERM, and the echo server demonstrably receives the probe.]
 - `go vet` clean on `protocol/musess`, `protocol/musess/fec`,
   `option`. Unit tests: codecs (incl. burst-pattern recovery and
   the klauspost nil-shard semantics), both controllers, the

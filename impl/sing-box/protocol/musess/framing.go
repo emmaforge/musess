@@ -157,7 +157,13 @@ func (c *streamPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 		return M.Socksaddr{}, err
 	}
 	length := int(binary.BigEndian.Uint16(lengthBytes[:]))
-	buffer.Reset()
+	// Do NOT Reset() here: the caller (bufio.CopyPacketWithPool) may have
+	// reserved front headroom in this buffer for the destination's
+	// WritePacket (e.g. SOCKS UDP header via ExtendHeader). Reset() zeroes
+	// start and destroys that headroom, crashing the destination with
+	// "buffer overflow" on ExtendHeader. Truncate(0) clears the length
+	// while preserving start.
+	buffer.Truncate(0)
 	if _, err = io.CopyN(buffer, c.Conn, int64(length)); err != nil {
 		return M.Socksaddr{}, err
 	}

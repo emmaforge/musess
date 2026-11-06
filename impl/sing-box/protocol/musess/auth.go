@@ -35,15 +35,16 @@ import (
 // an unauthenticated connection (forwarded to the destination), never
 // errored or dropped differently.
 //
-// authKey is derived from an X25519 exchange the client performs with
-// the server's static key: the client generates an ephemeral key pair
-// and adds its public key as an additional X25519 entry in the
-// ClientHello key_share extension (verified empirically against the
-// metacubex/utls fork used by this tree: an externally supplied share
-// survives ApplyPreset/MarshalClientHello verbatim). The server tries
-// every X25519 share in the hello until the tag verifies. The user's
-// secret is mixed into the key derivation, so possessing the server
-// public key alone is not enough to forge a tag.
+// authKey is derived from an X25519 exchange with the server's static
+// key, using the private key of the TLS session's own X25519 key share
+// (the share the parroted ClientHello already carries; uTLS exposes it
+// via HandshakeState.State13.KeyShareKeys.Ecdhe, see outbound
+// dialStream). No extra share is added to the hello — this is placement
+// P1, chosen on measurement (see impl/README.md): the shipped hello is
+// structurally identical to a stock Chrome parrot. The server verifies
+// the tag against that same session share. The user's secret is mixed
+// into the key derivation, so possessing the server public key alone is
+// not enough to forge a tag.
 
 const (
 	sessionIDLength  = 32
@@ -107,8 +108,8 @@ type ClientSessionAuth struct {
 }
 
 // NewClientSessionAuth performs the client side of the key agreement:
-// ephemeralPrivate is the private key matching the extra X25519 share
-// the client placed in its ClientHello.
+// ephemeralPrivate is the private key of the TLS session's own X25519
+// key share (NOT an extra share added to the hello).
 func NewClientSessionAuth(serverPublic *ecdh.PublicKey, ephemeralPrivate *ecdh.PrivateKey, uuid, secret string) (*ClientSessionAuth, error) {
 	shared, err := ephemeralPrivate.ECDH(serverPublic)
 	if err != nil {
