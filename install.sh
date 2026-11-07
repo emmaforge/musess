@@ -145,7 +145,7 @@ wizard(){
 
   mkdir -p "$DIR"
   cat > "$CFG" <<EOF
-{"log":{"level":"info"},"inbounds":[{"type":"musess","tag":"musess-in","listen":"0.0.0.0","listen_port":$PORT,"dest":"$DEST","dest_port":443,"private_key":"$PRIV","certificate_path":"$DIR/server-local.pem","key_path":"$DIR/server-local-key.pem","users":[{"name":"$USER","uuid":"$ID","secret":"$PW"}]$MUXF}],"outbounds":[{"type":"direct","tag":"direct"}]}
+{"log":{"level":"info"},"inbounds":[{"type":"musess","tag":"musess-in","listen":"::","listen_port":$PORT,"dest":"$DEST","dest_port":443,"private_key":"$PRIV","certificate_path":"$DIR/server-local.pem","key_path":"$DIR/server-local-key.pem","users":[{"name":"$USER","uuid":"$ID","secret":"$PW"}]$MUXF}],"outbounds":[{"type":"direct","tag":"direct"}]}
 EOF
   openssl req -x509 -newkey rsa:2048 -keyout "$DIR/server-local-key.pem" -out "$DIR/server-local.pem" -days 3650 -nodes -subj "/CN=$DEST" -addext "subjectAltName=DNS:$DEST" >/dev/null 2>&1 || die "证书生成失败"
   chmod 600 "$DIR/server-local-key.pem"
