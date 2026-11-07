@@ -68,7 +68,7 @@ func TestSealedRequestRoundTrip(t *testing.T) {
 		if sealed[0] != sealedRequestMarker {
 			t.Fatalf("sealed form must start with the marker byte, got %#x", sealed[0])
 		}
-		version, gotCommand, flags, gotDest, err := readRequestAuto(bytes.NewReader(sealed), earlyTestProofKey)
+		version, gotCommand, flags, gotDest, err := readRequestAuto(bytes.NewReader(sealed), earlyTestProofKey, nil, nil)
 		if err != nil {
 			t.Fatalf("fec=%v: readRequestAuto: %v", fecEnabled, err)
 		}
@@ -127,13 +127,13 @@ func TestSealedRequestTampered(t *testing.T) {
 	}
 	for name, mutate := range cases {
 		tampered := mutate(append([]byte(nil), sealed...))
-		if _, _, _, _, err := readRequestAuto(bytes.NewReader(tampered), earlyTestProofKey); err == nil {
+		if _, _, _, _, err := readRequestAuto(bytes.NewReader(tampered), earlyTestProofKey, nil, nil); err == nil {
 			t.Fatalf("%s: readRequestAuto accepted a tampered sealed request", name)
 		}
 	}
 	// A server holding a different session's proof key (e.g. an
 	// impostor that terminated TLS) cannot open the request either.
-	if _, _, _, _, err := readRequestAuto(bytes.NewReader(sealed), earlyTestWrongKey); err == nil {
+	if _, _, _, _, err := readRequestAuto(bytes.NewReader(sealed), earlyTestWrongKey, nil, nil); err == nil {
 		t.Fatal("readRequestAuto accepted a sealed request under the wrong proof key")
 	}
 	if _, err := openSealedRequest(earlyTestWrongKey, sealed[3:]); err == nil {
@@ -148,7 +148,7 @@ func TestReadRequestAutoPlainPassthrough(t *testing.T) {
 	if err := writeRequest(&v1, commandTCP, earlyTestDest); err != nil {
 		t.Fatal(err)
 	}
-	version, command, flags, dest, err := readRequestAuto(bytes.NewReader(v1.Bytes()), earlyTestProofKey)
+	version, command, flags, dest, err := readRequestAuto(bytes.NewReader(v1.Bytes()), earlyTestProofKey, nil, nil)
 	if err != nil {
 		t.Fatal("v1 plain:", err)
 	}
@@ -160,7 +160,7 @@ func TestReadRequestAutoPlainPassthrough(t *testing.T) {
 	if err := writeRequestV2(&v2, commandUDP, earlyTestDestUDP, testFECFlagRequest); err != nil {
 		t.Fatal(err)
 	}
-	version, command, flags, dest, err = readRequestAuto(bytes.NewReader(v2.Bytes()), earlyTestProofKey)
+	version, command, flags, dest, err = readRequestAuto(bytes.NewReader(v2.Bytes()), earlyTestProofKey, nil, nil)
 	if err != nil {
 		t.Fatal("v2 plain:", err)
 	}
@@ -211,7 +211,7 @@ func TestSealedRequestStreamBoundary(t *testing.T) {
 	tail := []byte("first-data-plane-bytes")
 	stream := append(append([]byte(nil), first...), tail...)
 	reader := bytes.NewReader(stream)
-	if _, _, _, _, err := readRequestAuto(reader, earlyTestProofKey); err != nil {
+	if _, _, _, _, err := readRequestAuto(reader, earlyTestProofKey, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	rest := make([]byte, reader.Len())

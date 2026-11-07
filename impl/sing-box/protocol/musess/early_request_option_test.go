@@ -119,7 +119,7 @@ func TestEarlyRequestCombinationFraming(t *testing.T) {
 			var dest M.Socksaddr
 			var err error
 			if serverOn {
-				_, command, _, dest, err = readRequestAuto(&wire, earlyTestProofKey)
+				_, command, _, dest, err = readRequestAuto(&wire, earlyTestProofKey, nil, nil)
 			} else {
 				_, command, _, dest, err = readRequest(&wire)
 			}

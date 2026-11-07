@@ -2159,6 +2159,78 @@ head-of-line; **FEC is not composed with mux** (mux sessions run
 over the plain TLS stream regardless of the fec option); stream
 deadlines are no-ops; one session per outbound (no pooling).
 
+**Mux landed in the production tree (2026-11-07,
+MUX-LANDING-REPORT.md).** The three landing prerequisites are
+done: per-stream flow control (initial window 16 MiB,
+receiver-driven doubling to 64 MiB), FEC×mux composition, and a
+frame/record-shape comparison against real browser H2 (mux data
+frames are 32 KiB, 2x H2's 16 KiB cap; one handshake carries 10
+streams vs 11 for stock — more browser-like on connections).
+Verdict: CONDITIONAL KEEP, opt-in, default off. Measured
+(delay100, 3x medians): seq10 4.181 s (stock) → 2.071 s (mux),
+= SS2022 (2.079 s); HTTPS first byte 0.411 s = SS2022.
+Known limitations, recorded not hidden: delay100 bulk256 tax
+~13.8% vs stock (1465 vs 1699 Mbps); loss25 mixed load
+reverses (mux 0.745 s vs stock 0.349 s, 2.1x slower); a held
+chunk stalls the whole session (session-level shared fate).
+mux+fec stays off on the TCP path (19–34% pure cost, zero
+benefit). Default-on waits for outside-sandbox validation.
+
+**Speculative transport landed in the production tree (2026-11-07,
+SPECULATIVE-REPORT.md).** Three independently switchable pieces,
+all default-off: warm pool (`warm_pool`, pre-established sessions
+with handshake + proof done, request sent only on checkout —
+pool size 2 as tested), safe 0-RTT (`zero_rtt`, one frame per
+session carrying only non-authenticated transport-recovery data,
+one-time nonce, replayed/corrupt frames treated as never sent),
+and racing (`race_servers`, parallel dial, first session to finish
+handshake + proof wins). Verdicts: warm pool KEEP (delay100 first
+byte p95 −43%, burst −37%, extra traffic +1–2%); all-on KEEP
+(delay100/burst); race KILL by the strict criterion (extra
+traffic +12–14% clean / +29% burst vs the ≤5% cap — stays
+default-off, pool-miss fallback only when explicitly enabled);
+0-RTT KILL as a first-byte tool by design (0% — it never carries
+the request, decision #4) and kept as a transport-state channel
+only. Merge-time fix: the prototype's serial refill (one session
+per 200 ms tick) could not keep up at low RTT (delay25 p95 never
+improved); the warmer now refills all missing slots in parallel,
+bounded by an inflight cap. Known limitation, recorded not hidden:
+the pool only fixes connection setup — it does not fix packet-loss
+recovery (that needs the QUIC Datagram FEC path, not built), and
+racing wins only when the alternate path is itself clean.
+Default-on waits for outside-sandbox validation.
+
+**Mux-bulk combo landed in the production tree (2026-11-07,
+MUXBULK-REPORT.md).** Three changes, all in the mux path: (1)
+initial window 16 → 64 MiB (`muxInitialWindow`) — the window
+ramp was the main tax (~20 of ~24 points at delay100: 16 MiB
+caps a stream at ~640 Mbps at 200 ms RTT, and the first 48 MiB
+of a 256 MiB transfer ran window-limited); (2) config-based bulk
+bypass (`mux_bypass: ["host" / "host:port" / ":port"]`) — listed
+destinations skip the mux session and take the plain
+(warm-pool / dialStream) path even when mux is on, because a
+byte threshold cannot be known at open time and mid-stream
+migration is infeasible; (3) warm mux sessions (`getMuxSession`
+checks out a pooled session first, falls back to a fresh dial).
+Measured (delay100, 3x medians): bulk256 0.94x SS2022 (was
+0.64x), bulk256-tls 0.96x (was 0.82x), seq10 0.95x, TTFB 1.00x.
+Correction to the mux note above: its "~13.8% bulk256 tax" did
+not reproduce — the idle-box bench measured ~29% and the probe
+baseline 24%; the combo in this note supersedes it. V-batch256
+frame batching (256 KiB blocks + vectorised writes) was tested
+and REJECTED (frames 7x larger, e2e throughput unchanged,
+server CPU +50%) — not merged. Known limitations, recorded not
+hidden: bulk32 is 0.59x in the full bench but 0.91x cold-start
+(setup/ramp dominated, fluctuates by run); one bypass round
+showed server data/reset frame counts inflated ~65x against
+open/window counts — suspected session-stats counting bug, kept
+as a known issue (the counting code increments once per frame
+in both directions; no cause found in the merged code, and no
+session-closed log line survived to reproduce it); loss bulk
+0.44x is untouched (needs the QUIC Datagram FEC path + Japan
+VPS). `mux_bypass` defaults to empty (off); win64 applies to
+all mux sessions; c1 rides the warm pool (default-on).
+
 ## 3. Combination bench
 
 Workloads: **ttfb** = a single 1 MiB transfer (setup-dominated);
@@ -2277,7 +2349,9 @@ the session's own establishment).
 **Outcome (2026-11-05): both recommendations RATIFIED by Emma
 as written.** early_request is now **default ON** on both
 peers; mux stays an opt-in experiment-tree prototype, default
-off, not promoted. The flip is a schema change only — no wire
+off, not promoted. (Update 2026-11-07: mux has since landed in
+the production tree — see the landing note in §2 — still
+opt-in, default off.) The flip is a schema change only — no wire
 behaviour changed in any peer combination:
 
 - The option is now tri-state: `early_request` is a `*bool`

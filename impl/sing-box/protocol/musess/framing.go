@@ -39,6 +39,36 @@ const (
 	// fecFlagReverse: the sender accepts FEC records in the
 	// reverse direction.
 	fecFlagReverse = 0x02
+	// deshellFlag: the sender offers the Direction 4 deshell
+	// (XTLS-Vision-style post-handshake raw splice; see deshell.go).
+	// TCP only, and only when FEC is off. The server answers in
+	// the v2 status byte (deshellStatusFlag).
+	deshellFlag = 0x04
+	// deshellAckFlag: the sender supports the deshell post-switch
+	// ack (deshell ack v1; see deshell.go). Set in the v2 request
+	// header alongside deshellFlag. The server answers in the v2
+	// status byte (deshellAckStatusFlag) when it wants the ack.
+	deshellAckFlag = 0x08
+)
+
+// Status-byte flags (v2 only, server -> client).
+const (
+	// fecStatusFlag: FEC duplex is active for this connection.
+	fecStatusFlag = 0x01
+	// deshellStatusFlag: the server agrees to deshell. It will
+	// switch to the raw TCP stream if the first inner record is a
+	// TLS 1.3 ClientHello, and will then send the deshell go-signal
+	// (deshell.go) so the client switches too. No signal is sent
+	// when the inner traffic is not TLS 1.3; the client then keeps
+	// reading through TLS and nothing changes.
+	deshellStatusFlag = 0x02
+	// deshellAckStatusFlag: the server requires the client to send
+	// the one-byte post-switch ack (deshell ack v1; see deshell.go).
+	// Set only when the client advertised deshellAckFlag, so old
+	// clients are never asked for an ack they cannot send (they
+	// keep the pre-ack behaviour, including the ~2% read-ahead
+	// race) and new clients always get the protection.
+	deshellAckStatusFlag = 0x04
 )
 
 func writeRequest(w io.Writer, command byte, destination M.Socksaddr) error {
@@ -67,11 +97,14 @@ func writeRequestV2(w io.Writer, command byte, destination M.Socksaddr, flags by
 }
 
 // buildRequestHeader renders a request header into memory: v2 with
-// flags when fecEnabled, v1 otherwise (mirrors the on-wire writers).
-func buildRequestHeader(fecEnabled bool, command byte, destination M.Socksaddr, flags byte) ([]byte, error) {
+// flags when useV2, v1 otherwise (mirrors the on-wire writers).
+// A v2 header is needed whenever FEC is enabled or deshell is
+// requested, because the server answers both negotiations in the
+// v2 status byte.
+func buildRequestHeader(useV2 bool, command byte, destination M.Socksaddr, flags byte) ([]byte, error) {
 	var buffer bytes.Buffer
 	var err error
-	if fecEnabled {
+	if useV2 {
 		err = writeRequestV2(&buffer, command, destination, flags)
 	} else {
 		err = writeRequest(&buffer, command, destination)
@@ -86,10 +119,44 @@ func buildRequestHeader(fecEnabled bool, command byte, destination M.Socksaddr, 
 // byte is a framing version) or sealed (first byte is
 // sealedRequestMarker; see auth.go). It lets an early_request server
 // keep accepting plain clients.
-func readRequestAuto(r io.Reader, proofKey []byte) (version byte, command byte, flags byte, destination M.Socksaddr, err error) {
+//
+// It also accepts at most one leading safe 0-RTT frame (first byte
+// zeroRTTMarker; see speculative.go) before the request. The frame is
+// decrypted against the TLS exporter and its one-time nonce checked:
+// a fresh nonce applies the (non-authenticated) transport state, a
+// replayed or corrupt frame is silently discarded, and in every case
+// the session still needs its normal authenticated request header
+// afterwards. The frame can never authenticate, route, or serve
+// anything, so a client sending one to a server that does not apply
+// 0-RTT state (zrt == nil or zrt.apply == false) still gets a normal
+// working session.
+func readRequestAuto(r io.Reader, proofKey []byte, zrt *zeroRTTServer, exporter []byte) (version byte, command byte, flags byte, destination M.Socksaddr, err error) {
 	var first [1]byte
 	if _, err = io.ReadFull(r, first[:]); err != nil {
 		return 0, 0, 0, M.Socksaddr{}, err
+	}
+	if first[0] == zeroRTTMarker {
+		var lengthBytes [2]byte
+		if _, err = io.ReadFull(r, lengthBytes[:]); err != nil {
+			return 0, 0, 0, M.Socksaddr{}, err
+		}
+		bodyLen := int(binary.BigEndian.Uint16(lengthBytes[:]))
+		if bodyLen > zeroRTTMaxBody {
+			return 0, 0, 0, M.Socksaddr{}, errors.New("musess: 0-RTT frame too large")
+		}
+		body := make([]byte, bodyLen)
+		if _, err = io.ReadFull(r, body); err != nil {
+			return 0, 0, 0, M.Socksaddr{}, err
+		}
+		if zrt != nil {
+			// Fresh, replayed, or corrupt: all three are safe
+			// outcomes here. Only a fresh frame changes anything
+			// (transport state), and it never changes routing.
+			_, _, _ = zrt.AcceptFrame(exporter, body)
+		}
+		if _, err = io.ReadFull(r, first[:]); err != nil {
+			return 0, 0, 0, M.Socksaddr{}, err
+		}
 	}
 	if first[0] != sealedRequestMarker {
 		return readRequest(io.MultiReader(bytes.NewReader(first[:]), r))

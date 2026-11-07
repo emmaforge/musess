@@ -32,6 +32,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -77,6 +78,10 @@ func main() {
 		err = runBulkServer(os.Args[2:])
 	case "bulkclient":
 		err = runBulkClient(os.Args[2:])
+	case "stallclient":
+		err = runStallClient(os.Args[2:])
+	case "h2tap":
+		err = runH2Tap(os.Args[2:])
 	default:
 		err = fmt.Errorf("unknown subcommand %q", os.Args[1])
 	}
@@ -697,6 +702,7 @@ func runBulkClient(args []string) error {
 	addr := fs.String("addr", "", "target address host:port to read from")
 	socks := fs.String("socks", "", "optional SOCKS5 proxy address host:port; -addr is then the target reached through it")
 	numBytes := fs.Int64("bytes", 32<<20, "number of bytes to read")
+	progress := fs.String("progress", "", "optional file to append timestamped progress lines (ms_since_start cumulative_bytes), one per ~100ms plus first/last byte")
 	_ = fs.Parse(args)
 	if *addr == "" {
 		return fmt.Errorf("bulkclient requires -addr")
@@ -715,8 +721,27 @@ func runBulkClient(args []string) error {
 	}
 	defer conn.Close()
 
-	buf := make([]byte, 256*1024)
+	var progFile *os.File
+	var progWriter *bufio.Writer
 	var got int64
+	if *progress != "" {
+		progFile, err = os.Create(*progress)
+		if err != nil {
+			return err
+		}
+		defer progFile.Close()
+		progWriter = bufio.NewWriter(progFile)
+		defer progWriter.Flush()
+	}
+	logProgress := func() {
+		if progWriter != nil {
+			fmt.Fprintf(progWriter, "%d %d\n", time.Since(start).Milliseconds(), got)
+		}
+	}
+
+	buf := make([]byte, 256*1024)
+	lastLog := start
+	firstByte := true
 	for got < *numBytes {
 		want := int64(len(buf))
 		if rem := *numBytes - got; rem < want {
@@ -724,14 +749,197 @@ func runBulkClient(args []string) error {
 		}
 		n, rerr := conn.Read(buf[:want])
 		got += int64(n)
+		if firstByte && n > 0 {
+			firstByte = false
+			logProgress() // first-byte line doubles as the TTFB sample
+			lastLog = time.Now()
+		} else if time.Since(lastLog) >= 100*time.Millisecond {
+			logProgress()
+			lastLog = time.Now()
+		}
 		if rerr != nil {
 			return fmt.Errorf("bulkclient: read %d of %d bytes: %w", got, *numBytes, rerr)
 		}
 	}
+	logProgress()
 	seconds := time.Since(start).Seconds()
 	mbps := float64(got) * 8 / seconds / 1e6
 	fmt.Printf("bytes=%d seconds=%.3f mbps=%.2f\n", got, seconds, mbps)
 	return nil
+}
+
+// runStallClient opens one SOCKS stream to a bulkserver and then
+// stops reading for -hold-seconds: the stalled consumer of the
+// mixed-load test. The server keeps producing, so without
+// per-stream flow control this stream's full inbox backpressures
+// the session reader and stalls every other stream; with flow
+// control only this stream stalls.
+func runStallClient(args []string) error {
+	fs := flag.NewFlagSet("stallclient", flag.ExitOnError)
+	addr := fs.String("addr", "", "target address host:port")
+	socks := fs.String("socks", "", "SOCKS5 proxy address host:port")
+	readBytes := fs.Int("read-bytes", 1024, "bytes to read before stalling")
+	holdSeconds := fs.Int("hold-seconds", 20, "seconds to hold the connection open without reading")
+	_ = fs.Parse(args)
+	if *addr == "" || *socks == "" {
+		return fmt.Errorf("stallclient requires -addr and -socks")
+	}
+	conn, err := socks5Dial(*socks, *addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Time{})
+	if *readBytes > 0 {
+		buf := make([]byte, *readBytes)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return fmt.Errorf("stallclient: initial read: %w", err)
+		}
+	}
+	fmt.Printf("stallclient: holding %s via %s for %ds (read %d bytes first)\n", *addr, *socks, *holdSeconds, *readBytes)
+	time.Sleep(time.Duration(*holdSeconds) * time.Second)
+	fmt.Printf("stallclient: done\n")
+	return nil
+}
+
+// runH2Tap is a TLS-terminating H2 frame tap: it presents the
+// dest certificate to the client (curl --http2), opens its own TLS
+// connection to the real H2 server, and logs every H2 frame
+// (type, length, stream id, direction, timestamp) as JSONL. It
+// terminates TLS twice, so it measures FRAME sizes, not timing:
+// timing comes from the passive record tap (record-tap.py),
+// which never decrypts.
+func runH2Tap(args []string) error {
+	fs := flag.NewFlagSet("h2tap", flag.ExitOnError)
+	listenAddr := fs.String("listen", "", "listen address, e.g. 127.0.0.1:15560")
+	targetAddr := fs.String("target", "", "H2 server address, e.g. 127.0.0.1:18543")
+	certFile := fs.String("cert", "", "certificate file (dest name)")
+	keyFile := fs.String("key", "", "key file")
+	logFile := fs.String("log", "", "JSONL frame log file")
+	_ = fs.Parse(args)
+	if *listenAddr == "" || *targetAddr == "" || *certFile == "" || *keyFile == "" || *logFile == "" {
+		return fmt.Errorf("h2tap requires -listen -target -cert -key -log")
+	}
+	cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+	if err != nil {
+		return err
+	}
+	logF, err := os.Create(*logFile)
+	if err != nil {
+		return err
+	}
+	defer logF.Close()
+	var logMu sync.Mutex
+	logFrame := func(dir, typ string, length int, stream uint32) {
+		logMu.Lock()
+		fmt.Fprintf(logF, "{\"t_ms\":%d,\"dir\":\"%s\",\"type\":\"%s\",\"len\":%d,\"stream\":%d}\n",
+			time.Now().UnixMilli(), dir, typ, length, stream)
+		logMu.Unlock()
+	}
+	serverTLS := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h2"}}
+	clientTLS := &tls.Config{InsecureSkipVerify: true, ServerName: "dest.test", NextProtos: []string{"h2"}}
+	listener, err := net.Listen("tcp", *listenAddr)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("h2tap listening on %s -> %s (TLS-terminating H2 frame tap)\n", *listenAddr, *targetAddr)
+	for {
+		raw, err := listener.Accept()
+		if err != nil {
+			return err
+		}
+		go func(raw net.Conn) {
+			defer raw.Close()
+			clientConn := tls.Server(raw, serverTLS)
+			if err := clientConn.Handshake(); err != nil {
+				return
+			}
+			if clientConn.ConnectionState().NegotiatedProtocol != "h2" {
+				fmt.Fprintf(os.Stderr, "h2tap: ALPN is %q, not h2; closing\n", clientConn.ConnectionState().NegotiatedProtocol)
+				return
+			}
+			serverConn, err := tls.Dial("tcp", *targetAddr, clientTLS)
+			if err != nil {
+				return
+			}
+			defer serverConn.Close()
+			done := make(chan struct{}, 2)
+			go func() {
+				h2TapPump(clientConn, serverConn, "c2s", true, logFrame)
+				if tc, ok := serverConn.NetConn().(*net.TCPConn); ok {
+					_ = tc.CloseWrite()
+				}
+				done <- struct{}{}
+			}()
+			go func() {
+				h2TapPump(serverConn, clientConn, "s2c", false, logFrame)
+				if tc, ok := clientConn.NetConn().(*net.TCPConn); ok {
+					_ = tc.CloseWrite()
+				}
+				done <- struct{}{}
+			}()
+			<-done
+		}(raw)
+	}
+}
+
+var h2FrameNames = map[byte]string{
+	0x0: "DATA", 0x1: "HEADERS", 0x2: "PRIORITY", 0x3: "RST_STREAM",
+	0x4: "SETTINGS", 0x5: "PUSH_PROMISE", 0x6: "PING", 0x7: "GOAWAY",
+	0x8: "WINDOW_UPDATE", 0x9: "CONTINUATION",
+}
+
+// h2TapPump forwards the plaintext H2 stream src -> dst, logging
+// each frame. On the client->server direction it first consumes
+// the 24-byte connection preface.
+func h2TapPump(src, dst net.Conn, dir string, isClient bool, logFrame func(dir, typ string, length int, stream uint32)) {
+	reader := bufio.NewReader(src)
+	writer := bufio.NewWriter(dst)
+	defer writer.Flush()
+	if isClient {
+		preface := make([]byte, 24)
+		if _, err := io.ReadFull(reader, preface); err != nil {
+			return
+		}
+		logFrame(dir, "PREFACE", 24, 0)
+		if _, err := writer.Write(preface); err != nil {
+			return
+		}
+		if err := writer.Flush(); err != nil {
+			return
+		}
+	}
+	header := make([]byte, 9)
+	for {
+		if _, err := io.ReadFull(reader, header); err != nil {
+			return
+		}
+		length := int(header[0])<<16 | int(header[1])<<8 | int(header[2])
+		frameType := header[3]
+		streamID := binary.BigEndian.Uint32(header[5:9]) & 0x7fffffff
+		name, ok := h2FrameNames[frameType]
+		if !ok {
+			name = fmt.Sprintf("UNKNOWN_%d", frameType)
+		}
+		payload := make([]byte, length)
+		if length > 0 {
+			if _, err := io.ReadFull(reader, payload); err != nil {
+				return
+			}
+		}
+		logFrame(dir, name, length, streamID)
+		if _, err := writer.Write(header); err != nil {
+			return
+		}
+		if length > 0 {
+			if _, err := writer.Write(payload); err != nil {
+				return
+			}
+		}
+		if err := writer.Flush(); err != nil {
+			return
+		}
+	}
 }
 
 // socks5Dial connects to targetAddr (IPv4 host:port) through the

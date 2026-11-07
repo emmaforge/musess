@@ -41,6 +41,13 @@ type Inbound struct {
 	replay       *replayCache
 	fecMode      fecMode
 	earlyRequest bool
+	deshell      bool
+	mux          bool
+	// zeroRTT is the inbound's safe-0-RTT state (nonce registry +
+	// counters). It is always present so a 0-RTT frame is parsed
+	// and discarded safely even when the server does not apply
+	// 0-RTT transport state.
+	zeroRTT *zeroRTTServer
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MusessInboundOptions) (adapter.Inbound, error) {
@@ -82,6 +89,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		replay:       newReplayCache(),
 		fecMode:      mode,
 		earlyRequest: options.EarlyRequestEnabled(),
+		deshell:      options.Deshell,
+		mux:          options.Mux,
+		zeroRTT:      newZeroRTTServer(options.ZeroRTT),
 	}
 	for _, user := range options.Users {
 		inbound.users = append(inbound.users, makeUserEntry(user.Name, user.UUID, user.Secret))
@@ -211,14 +221,17 @@ func (h *Inbound) serveAuthenticated(ctx context.Context, conn net.Conn, reader 
 		// readRequestAuto additionally accepts plain requests, so
 		// enabling early_request on the server alone is safe for
 		// stock clients; only the client side requires both peers.
-		version, command, flags, destination, err = readRequestAuto(tlsConn, verified.proofKey)
+		version, command, flags, destination, err = readRequestAuto(tlsConn, verified.proofKey, h.zeroRTT, exporter)
 		if err != nil {
 			h.logger.DebugContext(ctx, "musess: read early request failed: ", err)
 			conn.Close()
 			return
 		}
 	} else {
-		version, command, flags, destination, err = readRequest(tlsConn)
+		// readRequestAuto also accepts plain requests, and a
+		// leading safe 0-RTT frame, so a zero_rtt client works
+		// against a server with early_request off as well.
+		version, command, flags, destination, err = readRequestAuto(tlsConn, verified.proofKey, h.zeroRTT, exporter)
 		if err != nil {
 			h.logger.DebugContext(ctx, "musess: read request failed: ", err)
 			conn.Close()
@@ -229,12 +242,36 @@ func (h *Inbound) serveAuthenticated(ctx context.Context, conn net.Conn, reader 
 	// gets a one-byte answer — 0x01 if this inbound also has FEC
 	// enabled (duplex active), 0x00 otherwise. A v1 client never
 	// reads a status byte and never gets one.
+	//
+	// Deshell (Direction 4) rides the same status byte: bit 0x02
+	// agrees to deshell when the option is on, the client requested
+	// it, FEC is not active (the two are mutually exclusive), and
+	// the command is a TCP stream. Agreeing here only arms the
+	// wrapper's inspection; the actual switch happens inside the
+	// wrapper once the first inner record proves to be a TLS 1.3
+	// ClientHello (see deshell.go).
+	//
+	// Deshell ack v1 rides the same byte as well: bit 0x04 asks the
+	// client for the post-switch ack, but only when the client
+	// advertised deshellAckFlag (0x08) in its request header. An old
+	// client never advertises it, so a new server never waits for
+	// an ack it cannot send and pays no timeout.
 	fecActive := false
+	deshellAgreed := false
+	deshellAckWanted := false
 	if version == framingVersion2 {
 		fecActive = h.fecMode.enabled() && flags&fecFlagForward != 0 && flags&fecFlagReverse != 0
 		status := byte(0x00)
 		if fecActive {
-			status = 0x01
+			status = fecStatusFlag
+		}
+		if !fecActive && h.deshell && command == commandTCP && flags&deshellFlag != 0 {
+			deshellAgreed = true
+			status |= deshellStatusFlag
+			if flags&deshellAckFlag != 0 {
+				deshellAckWanted = true
+				status |= deshellAckStatusFlag
+			}
 		}
 		if _, err = tlsConn.Write([]byte{status}); err != nil {
 			conn.Close()
@@ -256,6 +293,8 @@ func (h *Inbound) serveAuthenticated(ctx context.Context, conn net.Conn, reader 
 		h.logger.InfoContext(ctx, "[", verified.user.name, "] inbound connection to ", destination)
 		if fecActive {
 			h.router.RouteConnectionEx(ctx, newFECConn(tlsConn, h.fecMode, false, h.logger), metadata, onClose)
+		} else if deshellAgreed {
+			h.router.RouteConnectionEx(ctx, newServerDeshellConn(ctx, tlsConn, conn, reader, h.logger, deshellAckWanted), metadata, onClose)
 		} else {
 			h.router.RouteConnectionEx(ctx, tlsConn, metadata, onClose)
 		}
@@ -273,8 +312,48 @@ func (h *Inbound) serveAuthenticated(ctx context.Context, conn net.Conn, reader 
 		} else {
 			h.router.RoutePacketConnectionEx(ctx, newStreamPacketConn(tlsConn), metadata, onClose)
 		}
+	case commandMux:
+		if !h.mux {
+			// Fail closed: a mux client against a mux-off server
+			// is rejected after authentication, never forwarded
+			// and never mistaken for an unauthenticated connection.
+			h.logger.DebugContext(ctx, "musess: mux session rejected (mux disabled on this inbound)")
+			conn.Close()
+			return
+		}
+		h.logger.InfoContext(ctx, "[", verified.user.name, "] inbound mux session from ", metadata.Source)
+		// The data-plane transport: plain TLS, or fec.Conn when FEC
+		// was negotiated for this session (mux sessions and plain
+		// streams share this transport selection). Deshell never
+		// applies here: it is agreed only for commandTCP streams.
+		dataConn := net.Conn(tlsConn)
+		if fecActive {
+			dataConn = newFECConn(tlsConn, h.fecMode, false, h.logger)
+		}
+		h.serveMuxSession(ctx, dataConn, metadata, verified.user.name, onClose)
 	default:
 		h.logger.DebugContext(ctx, "musess: unknown command ", command)
 		conn.Close()
+	}
+}
+
+// serveMuxSession serves one multiplexed session: each stream the
+// client opens is routed independently through the normal router
+// with its own destination. Per-stream onClose is a no-op — the
+// outer connection's onClose is invoked exactly once, when the
+// session itself ends — so one session's N streams cannot trigger
+// N outer-connection close callbacks.
+func (h *Inbound) serveMuxSession(ctx context.Context, transport net.Conn, baseMeta adapter.InboundContext, user string, onClose N.CloseHandlerFunc) {
+	session := newMuxSession(transport, false, func(stream *muxStream, command byte, destination M.Socksaddr) {
+		metadata := baseMeta
+		metadata.Destination = destination
+		metadata.User = user
+		h.logger.InfoContext(ctx, "[", user, "] inbound mux stream to ", destination)
+		h.router.RouteConnectionEx(ctx, stream, metadata, func(error) {})
+	}, h.logger)
+	session.start()
+	<-session.Done()
+	if onClose != nil {
+		onClose(nil)
 	}
 }
