@@ -1,145 +1,71 @@
-#!/usr/bin/env bash
-# musess 一键安装脚本
-#
-# 在服务器上以 root 运行：
-#   bash <(curl -sL https://raw.githubusercontent.com/emmaforge/musess/main/install.sh)
-# 自定义（端口 / 借站 / 用户名 / 已有凭证）：
-#   curl -sL https://raw.githubusercontent.com/emmaforge/musess/main/install.sh \
-#     | sudo bash -s -- --port 8443 --dest www.yahoo.co.jp --user emma
-# 或用环境变量：MUSESS_PORT / MUSESS_DEST / MUSESS_USER / MUSESS_UUID /
-#   MUSESS_SECRET / MUSESS_PRIVATE_KEY（base64 的 X25519 私钥）/ MUSESS_REF（提交）。
-#
-# 未提供的 UUID / secret / 私钥会在本机生成；私钥只写进 /etc/musess/server.json，
-# 不会上传到任何地方。装完脚本会打印公钥、客户端配置和节点链接，请妥善保存。
-#
-# 默认值与代码一致：脱壳、多路复用默认关（预热池是客户端默认开，无需服务端配置）。
-# 如需开启脱壳/多路复用，改 /etc/musess/server.json 的 inbound，加上
-# "deshell": true / "mux": true 后 systemctl restart musess。
-set -euo pipefail
+#!/bin/sh
+# musess 一键安装脚本 - POSIX sh，交互选择，装完生成节点链接
+# 用法：curl -fsSL -o install.sh https://raw.githubusercontent.com/emmaforge/musess/main/install.sh && sh install.sh
+# 装好后输入 ms 打开面板（查看链接/重启/状态/卸载）
+# 本脚本直接下载 GitHub Release 里的预编译二进制，不再现场编译 Go（不需要 Go、不需要 git clone）。
+BIN=/usr/local/bin/sing-box-musess; DIR=/etc/musess; CFG=$DIR/server.json; INFO=$DIR/info.env
+REL_TAG=v0.1.0
 
-PORT="${MUSESS_PORT:-443}"
-DEST="${MUSESS_DEST:-www.yahoo.co.jp}"
-USER_NAME="${MUSESS_USER:-emma}"
-USER_UUID="${MUSESS_UUID:-}"
-USER_SECRET="${MUSESS_SECRET:-}"
-PRIVATE_KEY="${MUSESS_PRIVATE_KEY:-}"
-REPO_REF="${MUSESS_REF:-d5452b51991867899595313095aa6c3d241d8bea}"
+say(){ printf '%s\n' "$*"; }
+ask(){ printf '%s' "$1"; IFS= read -r REPLY; }
+die(){ say "错误: $*"; exit 1; }
+[ "$(id -u)" = 0 ] || die "请用 root 运行"
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --port) PORT="$2"; shift 2 ;;
-    --dest) DEST="$2"; shift 2 ;;
-    --user) USER_NAME="$2"; shift 2 ;;
-    --uuid) USER_UUID="$2"; shift 2 ;;
-    --secret) USER_SECRET="$2"; shift 2 ;;
-    --private-key) PRIVATE_KEY="$2"; shift 2 ;;
-    --ref) REPO_REF="$2"; shift 2 ;;
-    -h|--help) echo "用法：bash install.sh [--port 端口] [--dest 借站域名] [--user 用户名] [--uuid UUID] [--secret 密钥] [--private-key 私钥] [--ref 提交]"; exit 0 ;;
-    *) echo "未知参数: $1" >&2; exit 1 ;;
+uuid(){ cat /proc/sys/kernel/random/uuid; }
+randpw(){ head -c 32 /dev/urandom | base64 | tr -d '\n'; }
+qenc(){ printf '%s' "$1" | sed -e 's/+/%2B/g' -e 's/\//%2F/g' -e 's/=/%3D/g'; }
+
+has_sd(){ [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }
+has_rc(){ command -v rc-update >/dev/null 2>&1; }
+
+# 预编译安装只需要约 150MB（60MB 二进制 + 配置/证书），不再需要 4GB 编译空间。
+disk_check(){
+  free_kb=$(df -k / | awk 'NR==2 {print $4}')
+  [ -n "$free_kb" ] && [ "$free_kb" -gt 262144 ] && return 0
+  die "磁盘剩余空间不足：预编译安装只需约 256MB 空闲，当前约 $((free_kb / 1024))MB。先清理或扩容磁盘后再装。"
+}
+
+deps(){
+  for c in curl openssl; do command -v "$c" >/dev/null 2>&1 || need=1; done
+  [ -z "${need:-}" ] && return 0
+  [ -f /etc/os-release ] && . /etc/os-release; os=${ID:-unknown}
+  case "$os" in
+    alpine) apk add --no-cache curl openssl ca-certificates >/dev/null 2>&1 ;;
+    debian|ubuntu) apt-get update -qq && apt-get install -y -qq curl openssl ca-certificates >/dev/null 2>&1 ;;
+    centos|rhel|rocky|almalinux|fedora|ol) (command -v dnf >/dev/null && dnf install -y -q curl openssl ca-certificates || yum install -y -q curl openssl ca-certificates) >/dev/null 2>&1 ;;
+    arch|manjaro) pacman -Sy --noconfirm curl openssl ca-certificates >/dev/null 2>&1 ;;
+    *) say "未识别系统 $os，假设依赖已齐全" ;;
   esac
-done
-
-[ "$(id -u)" -eq 0 ] || { echo "请以 root 运行" >&2; exit 1; }
-for cmd in curl openssl git; do
-  command -v "$cmd" >/dev/null 2>&1 || {
-    echo "缺少 $cmd，尝试安装…"
-    if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq "$cmd"
-    elif command -v yum >/dev/null 2>&1; then yum install -y -q "$cmd"
-    else echo "请先手动安装 $cmd" >&2; exit 1; fi
-  }
-done
-
-ARCH="$(uname -m)"
-case "$ARCH" in
-  x86_64) GO_ARCH=amd64 ;;
-  aarch64) GO_ARCH=arm64 ;;
-  *) echo "不支持的架构: $ARCH" >&2; exit 1 ;;
-esac
-
-# 1. Go 1.24.7
-if ! command -v go >/dev/null 2>&1; then
-  echo "==> 安装 Go 1.24.7"
-  curl -sL "https://go.dev/dl/go1.24.7.linux-${GO_ARCH}.tar.gz" -o /tmp/go1.24.7.tgz
-  tar -C /usr/local -xzf /tmp/go1.24.7.tgz
-fi
-export PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=local
-
-# 2. 凭证：缺失的在本机生成
-[ -n "$USER_UUID" ] || USER_UUID="$(cat /proc/sys/kernel/random/uuid)"
-[ -n "$USER_SECRET" ] || USER_SECRET="$(openssl rand -base64 32 | tr -d '\n')"
-cat > /tmp/musess-keygen.go <<'GOEOF'
-package main
-
-import (
-	"crypto/ecdh"
-	"crypto/rand"
-	"encoding/base64"
-	"fmt"
-	"os"
-)
-
-func main() {
-	var k *ecdh.PrivateKey
-	if p := os.Getenv("MUSESS_PRIV_B64"); p != "" {
-		b, err := base64.StdEncoding.DecodeString(p)
-		if err != nil {
-			panic(err)
-		}
-		k, err = ecdh.X25519().NewPrivateKey(b)
-		if err != nil {
-			panic(err)
-		}
-	} else {
-		var err error
-		k, err = ecdh.X25519().GenerateKey(rand.Reader)
-		if err != nil {
-			panic(err)
-		}
-	}
-	fmt.Println(base64.StdEncoding.EncodeToString(k.Bytes()))
-	fmt.Println(base64.StdEncoding.EncodeToString(k.PublicKey().Bytes()))
 }
-GOEOF
-mapfile -t _KEYS < <(MUSESS_PRIV_B64="$PRIVATE_KEY" go run /tmp/musess-keygen.go)
-PRIVATE_KEY="${_KEYS[0]}"
-PUBLIC_KEY="${_KEYS[1]}"
 
-# 3. 拉代码并编译（仓库已公开，无需鉴权）
-echo "==> 拉取 musess@$REPO_REF"
-[ -d /opt/musess/.git ] || git clone https://github.com/emmaforge/musess.git /opt/musess
-cd /opt/musess && git fetch -q && git checkout -q "$REPO_REF"
-echo "==> 编译 sing-box-musess"
-cd /opt/musess/impl/sing-box
-go build -trimpath \
-  -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=1.14.0-alpha.2-musess-m1' $(cat release/LDFLAGS) -s -w -buildid=" \
-  -tags "$(cat release/DEFAULT_BUILD_TAGS_OTHERS)" \
-  -o /usr/local/bin/sing-box-musess ./cmd/sing-box
-
-# 4. 服务端配置 + 借站域名的本地证书
-mkdir -p /etc/musess
-cat > /etc/musess/server.json <<EOF
-{
-  "log": {"level": "info", "timestamp": true},
-  "inbounds": [{
-    "type": "musess", "tag": "musess-in",
-    "listen": "0.0.0.0", "listen_port": $PORT,
-    "dest": "$DEST", "dest_port": 443,
-    "private_key": "$PRIVATE_KEY",
-    "certificate_path": "/etc/musess/server-local.pem",
-    "key_path": "/etc/musess/server-local-key.pem",
-    "users": [{"name": "$USER_NAME", "uuid": "$USER_UUID", "secret": "$USER_SECRET"}]
-  }],
-  "outbounds": [{"type": "direct", "tag": "direct"}]
+# X25519 密钥对用 openssl 生成（私钥 32 字节在 PKCS#8 DER 末尾，公钥 32 字节在
+# SubjectPublicKeyInfo DER 末尾；已在沙箱用 Go ecdh 交叉验证：从私钥重算的公钥一致）。
+# 私钥只写进服务端配置，不会上传到任何地方。
+keygen(){
+  openssl genpkey -algorithm X25519 -out /tmp/musess-key.pem 2>/dev/null || die "密钥生成失败"
+  PRIV=$(openssl pkey -in /tmp/musess-key.pem -outform DER 2>/dev/null | tail -c 32 | base64 | tr -d '\n')
+  PUB=$(openssl pkey -in /tmp/musess-key.pem -pubout -outform DER 2>/dev/null | tail -c 32 | base64 | tr -d '\n')
+  rm -f /tmp/musess-key.pem
+  [ "${#PRIV}" = 44 ] && [ "${#PUB}" = 44 ] || die "密钥生成失败"
 }
-EOF
-openssl req -x509 -newkey rsa:2048 \
-  -keyout /etc/musess/server-local-key.pem \
-  -out /etc/musess/server-local.pem \
-  -days 3650 -nodes \
-  -subj "/CN=$DEST" -addext "subjectAltName=DNS:$DEST" 2>/dev/null
 
-# 5. systemd 服务并启动
-cat > /etc/systemd/system/musess.service <<EOF
+install_bin(){
+  case "$(uname -m)" in x86_64|amd64) a=amd64;; aarch64|arm64) a=arm64;; *) die "不支持架构 $(uname -m)";; esac
+  file="sing-box-musess-linux-$a"
+  url="https://github.com/emmaforge/musess/releases/download/$REL_TAG/$file"
+  say "下载预编译二进制 $file（约 60MB，无需编译）..."
+  tmpd=$(mktemp -d) || die "建临时目录失败"
+  curl -fsSL -o "$tmpd/$file" "$url" || { rm -rf "$tmpd"; die "下载失败：请检查网络，或到 https://github.com/emmaforge/musess/releases 手动下载"; }
+  curl -fsSL -o "$tmpd/$file.sha256" "$url.sha256" || { rm -rf "$tmpd"; die "校验和下载失败"; }
+  (cd "$tmpd" && sha256sum -c "$file.sha256" >/dev/null 2>&1) || { rm -rf "$tmpd"; die "校验和不匹配：下载的文件可能损坏，请重装"; }
+  mv "$tmpd/$file" "$BIN"; chmod +x "$BIN"; rm -rf "$tmpd"
+  "$BIN" version >/dev/null 2>&1 || die "二进制无法运行（架构可能不匹配）"
+}
+
+svc_install(){
+  mkdir -p "$DIR"
+  if has_sd; then
+    cat > /etc/systemd/system/musess.service <<'EOF'
 [Unit]
 Description=musess server
 After=network.target
@@ -149,60 +75,127 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
-systemctl enable --now musess >/dev/null
-
-# 6. 打印结果：公网 IP、客户端配置、节点链接
-PUBLIC_IP="$(curl -s --max-time 5 https://ifconfig.me || true)"
-[ -n "$PUBLIC_IP" ] || PUBLIC_IP="$(hostname -I | awk '{print $1}')"
-[ -n "$PUBLIC_IP" ] || PUBLIC_IP="<你的服务器 IP>"
-cat > /etc/musess/client.json <<EOF
-{
-  "log": {"level": "info", "timestamp": true},
-  "inbounds": [{
-    "type": "socks", "tag": "socks-in",
-    "listen": "127.0.0.1", "listen_port": 1080
-  }],
-  "outbounds": [
-    {
-      "type": "musess", "tag": "musess-out",
-      "server": "$PUBLIC_IP", "server_port": $PORT,
-      "server_name": "$DEST",
-      "public_key": "$PUBLIC_KEY",
-      "uuid": "$USER_UUID",
-      "secret": "$USER_SECRET"
-    },
-    {"type": "direct", "tag": "direct"}
-  ],
-  "route": {"final": "musess-out"}
-}
+    systemctl daemon-reload; systemctl enable musess >/dev/null 2>&1; systemctl restart musess
+  elif has_rc; then
+    cat > /etc/init.d/musess <<'EOF'
+#!/sbin/openrc-run
+name="musess"
+command="/usr/local/bin/sing-box-musess"
+command_args="run -c /etc/musess/server.json"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+depend(){ need net; }
 EOF
+    chmod +x /etc/init.d/musess; rc-update add musess default >/dev/null 2>&1; rc-service musess restart >/dev/null 2>&1 || rc-service musess start
+  else
+    pkill -f "$BIN run" 2>/dev/null; nohup "$BIN" run -c "$CFG" >/dev/null 2>&1 &
+    say "无 systemd/OpenRC，已后台启动（无自启）"
+  fi
+}
+svc_stop(){
+  if has_sd; then systemctl stop musess 2>/dev/null; systemctl disable musess 2>/dev/null; rm -f /etc/systemd/system/musess.service; systemctl daemon-reload
+  elif has_rc; then rc-service musess stop 2>/dev/null; rc-update del musess default 2>/dev/null; rm -f /etc/init.d/musess
+  else pkill -f "$BIN run" 2>/dev/null; fi
+}
+svc_restart(){ if has_sd; then systemctl restart musess; elif has_rc; then rc-service musess restart; else pkill -f "$BIN run" 2>/dev/null; nohup "$BIN" run -c "$CFG" >/dev/null 2>&1 & fi; }
+svc_status(){ if has_sd; then systemctl is-active musess; elif has_rc; then rc-service musess status; else pgrep -f "$BIN run" >/dev/null && say running || say stopped; fi; }
 
-echo
-echo "================ musess 已启动 ================"
-systemctl is-active --quiet musess && echo "服务状态：active" || { echo "服务启动失败，查看：journalctl -u musess -n 50"; exit 1; }
-echo "服务器：$PUBLIC_IP:$PORT（借站 $DEST）"
-echo "用户：$USER_NAME"
-echo "UUID：$USER_UUID"
-echo "Secret：$USER_SECRET"
-echo "公钥：$PUBLIC_KEY"
-echo "私钥（已写入 /etc/musess/server.json）：$PRIVATE_KEY"
-echo
-echo "客户端配置已保存到 /etc/musess/client.json，内容如下："
-cat /etc/musess/client.json
-if command -v python3 >/dev/null 2>&1; then
-  echo
-  echo "节点链接："
-  python3 - "$USER_UUID" "$PUBLIC_IP" "$PORT" "$USER_SECRET" "$PUBLIC_KEY" "$DEST" <<'PYEOF'
-import sys, urllib.parse
-uuid, server, port, secret, pub, dest = sys.argv[1:7]
-q = urllib.parse.quote
-link = (f"musess://{uuid}@{server}:{port}"
-        f"?secret={q(secret)}&public_key={q(pub)}"
-        f"&server_name={q(dest)}&warm_pool=2#musess")
-print(link)
-PYEOF
-fi
-echo "================================================"
-echo "电脑客户端：用本仓库编译的 sing-box + 上面的 client.json，"
-echo "socks 入口 127.0.0.1:1080。"
+# ---------- 安装向导：借站 -> 端口 -> 方案 -> 用户名，逐级选 ----------
+wizard(){
+  say "=== 1/3 选择借站目标 ==="
+  say "1) www.yahoo.co.jp（推荐，日本第一门户）  2) ja.wikipedia.org  3) www.mixi.jp  4) 自定义"
+  ask "输入编号 [1]: "; c=${REPLY:-1}
+  case "$c" in
+    1) DEST=www.yahoo.co.jp;;
+    2) DEST=ja.wikipedia.org;;
+    3) DEST=www.mixi.jp;;
+    4) ask "输入借站域名: "; DEST=$REPLY; [ -n "$DEST" ] || die "域名为空";;
+    *) die "无效选择";;
+  esac
+
+  ask "端口 [443]: "; PORT=${REPLY:-443}
+  case "$PORT" in ''|*[!0-9]*) die "端口无效";; esac
+
+  say "=== 2/3 选择性能方案 ==="
+  say "1) 推荐均衡（预热池开，脱壳/多路复用关）"
+  say "2) 大文件优先（多路复用开，大文件绕开 mux）"
+  say "3) 晚高峰抗丢包（多路复用开，丢包时自动绕开 mux）"
+  ask "输入编号 [1]: "; c=${REPLY:-1}
+  case "$c" in
+    1) PRESET=1;;
+    2) PRESET=2;;
+    3) PRESET=3;;
+    *) die "无效选择";;
+  esac
+
+  ask "用户名 [emma]: "; USER=${REPLY:-emma}
+
+  IP=$(curl -fsSL -4 --max-time 5 https://api.ipify.org 2>/dev/null || curl -fsSL -4 --max-time 5 https://ip.sb 2>/dev/null)
+  ask "服务器地址 [${IP:-手动输入}]: "; ADDR=${REPLY:-$IP}; [ -n "$ADDR" ] || die "地址为空"
+
+  say "借站=$DEST 端口=$PORT 方案=$PRESET 用户=$USER 地址=$ADDR"
+  deps; install_bin; keygen
+  ID=$(uuid); PW=$(randpw)
+
+  case "$PRESET" in
+    2) MUXF=',"mux":true'; COPT=',"mux":true,"mux_bypass":[":443"]'; EXTRA='&mux=1&mux_bypass=%3A443';;
+    3) MUXF=',"mux":true'; COPT=',"mux":true,"mux_adaptive_bypass":true'; EXTRA='&mux=1&mux_adaptive_bypass=1';;
+    *) MUXF=''; COPT=''; EXTRA='';;
+  esac
+
+  mkdir -p "$DIR"
+  cat > "$CFG" <<EOF
+{"log":{"level":"info"},"inbounds":[{"type":"musess","tag":"musess-in","listen":"0.0.0.0","listen_port":$PORT,"dest":"$DEST","dest_port":443,"private_key":"$PRIV","certificate_path":"$DIR/server-local.pem","key_path":"$DIR/server-local-key.pem","users":[{"name":"$USER","uuid":"$ID","secret":"$PW"}]$MUXF}],"outbounds":[{"type":"direct","tag":"direct"}]}
+EOF
+  openssl req -x509 -newkey rsa:2048 -keyout "$DIR/server-local-key.pem" -out "$DIR/server-local.pem" -days 3650 -nodes -subj "/CN=$DEST" -addext "subjectAltName=DNS:$DEST" >/dev/null 2>&1 || die "证书生成失败"
+  chmod 600 "$DIR/server-local-key.pem"
+  "$BIN" check -c "$CFG" >/dev/null || die "服务端配置校验失败"
+
+  cat > "$DIR/client.json" <<EOF
+{"log":{"level":"info"},"inbounds":[{"type":"socks","tag":"socks-in","listen":"127.0.0.1","listen_port":1080}],"outbounds":[{"type":"musess","tag":"musess-out","server":"$ADDR","server_port":$PORT,"server_name":"$DEST","public_key":"$PUB","uuid":"$ID","secret":"$PW"$COPT},{"type":"direct","tag":"direct"}],"route":{"final":"musess-out"}}
+EOF
+  "$BIN" check -c "$DIR/client.json" >/dev/null || die "客户端配置校验失败"
+
+  cat > "$INFO" <<EOF
+DEST='$DEST'
+PORT='$PORT'
+PRESET='$PRESET'
+USER='$USER'
+ADDR='$ADDR'
+ID='$ID'
+PW='$PW'
+PRIV='$PRIV'
+PUB='$PUB'
+EXTRA='$EXTRA'
+EOF
+  chmod 600 "$INFO"
+  cp -f "$0" /usr/local/bin/ms 2>/dev/null && chmod +x /usr/local/bin/ms
+  svc_install; sleep 1; gen_link
+  say "自启: $(has_sd && say systemd已启用 || (has_rc && say OpenRC已启用 || say 无)) | 状态: $(svc_status 2>/dev/null | head -1)"
+  say "以后输入 ms 打开面板"
+}
+
+gen_link(){
+  [ -f "$INFO" ] || die "未安装"
+  . "$INFO"
+  LINK="musess://$ID@$ADDR:$PORT?secret=$(qenc "$PW")&public_key=$(qenc "$PUB")&server_name=$DEST&warm_pool=2$EXTRA#musess"
+  printf '%s' "$LINK" > "$DIR/link.txt"
+  say ""; say "=== 节点链接 ==="; say "$LINK"
+  say ""; say "用户: $USER  UUID: $ID"; say "Secret: $PW"; say "公钥: $PUB"; say "私钥(已写入 $CFG): $PRIV"
+  say "客户端配置: $DIR/client.json"
+}
+
+panel(){
+  say "=== musess 面板 ==="; say "1) 安装/重装节点  2) 查看链接  3) 重启  4) 状态  5) 卸载  0) 退出"
+  ask "输入编号: "; case "${REPLY:-0}" in
+    1) wizard;; 2) cat "$DIR/link.txt" 2>/dev/null || gen_link;;
+    3) svc_restart; say 已重启;; 4) svc_status;; 5) svc_stop; rm -rf "$DIR" "$BIN" /usr/local/bin/ms /opt/musess; say 已卸载;; *) exit 0;; esac
+}
+
+disk_check
+case "$1" in
+  link) gen_link;; restart) svc_restart;; status) svc_status;;
+  stop) svc_stop;; uninstall) svc_stop; rm -rf "$DIR" "$BIN" /usr/local/bin/ms /opt/musess; say 已卸载;;
+  "") [ -f "$CFG" ] && panel || wizard ;;
+  *) wizard ;;
+esac

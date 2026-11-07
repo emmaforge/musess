@@ -13,29 +13,29 @@
 
 ## 一键安装
 
-在服务器上以 root 运行一行命令（Linux x86_64 / arm64，需 curl、openssl、git，443 端口空闲）：
+在服务器上以 root 运行（Linux x86_64 / arm64，需 256MB 空闲磁盘，443 端口空闲）：
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/emmaforge/musess/main/install.sh)
+curl -fsSL -o install.sh https://raw.githubusercontent.com/emmaforge/musess/main/install.sh && sh install.sh
 ```
 
-脚本会：安装 Go 1.24.7 → 拉取代码（钉在测过的提交）→ 编译 sing-box → 写
-`/etc/musess/server.json` → 给借站域名签本地证书 → 起 systemd 服务并启动。
-装完打印用户 UUID / secret、公钥 / 私钥、客户端配置和节点链接，请妥善保存。
+逐级选择：借站目标 → 端口 → 性能方案 → 用户名，装完直接输出节点链接。
+装好后输入 `ms` 打开面板（查看链接/重启/状态/卸载）。
 
-自定义端口、借站、用户名或自带凭证：
+子命令：`ms link|status|restart|stop|uninstall`
 
-```bash
-curl -sL https://raw.githubusercontent.com/emmaforge/musess/main/install.sh \
-  | sudo bash -s -- --port 8443 --dest www.yahoo.co.jp --user emma
-# 或用环境变量：MUSESS_PORT / MUSESS_DEST / MUSESS_USER / MUSESS_UUID /
-#   MUSESS_SECRET / MUSESS_PRIVATE_KEY（base64 的 X25519 私钥）/ MUSESS_REF
-```
+脚本会：下载 GitHub Release v0.1.0 里的预编译二进制（按架构自动选，
+附 sha256 校验）→ 写服务端配置 → 给借站域名签本地证书 → 起服务。
+不编译、不装 Go。UUID、secret、X25519 密钥对自动生成（openssl），
+只写进本机配置，不会上传到任何地方。
 
-没提供的 UUID / secret / 私钥会在本机生成，不会上传到任何地方。
-默认值与代码一致：脱壳、多路复用默认关（预热池是客户端默认开，无需服务端配置）。
+性能方案：1）推荐均衡（预热池开，脱壳/多路复用关） 2）大文件优先（多路复用开，
+大文件绕开 mux） 3）晚高峰抗丢包（多路复用开，丢包时自动绕开 mux）。
 
-装好后，电脑客户端用本仓库编译的 sing-box + 脚本打印的 `client.json`
+磁盘空间不够会在一开始就报错；如果之前装失败了，先 `ms uninstall` 再重装，
+或到 [Releases](https://github.com/emmaforge/musess/releases) 手动下载二进制。
+
+装好后，电脑客户端用本仓库编译的 sing-box + `/etc/musess/client.json`
 （本机 socks 入口 `127.0.0.1:1080`）。原版 sing-box 与常见客户端暂不支持 musess。
 
 ## 已定决策
