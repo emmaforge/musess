@@ -16,7 +16,6 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -690,31 +689,11 @@ func (h *Outbound) clientHandshake(ctx context.Context, rawConn net.Conn) (*utls
 		MinVersion:             utls.VersionTLS13,
 	}
 	uConn := utls.UClient(rawConn, uConfig, utls.HelloCustom)
-	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_120)
+	// Chrome 152 parrot (see chrome152.go). The resulting JA4 is
+	// t13d1517h2_8daaf6152771_cb7bf5808d99.
+	spec, err := chrome152Spec()
 	if err != nil {
 		return nil, nil, err
-	}
-	for i, extension := range spec.Extensions {
-		switch ext := extension.(type) {
-		case *utls.KeyShareExtension:
-			ext.KeyShares = common.Filter(ext.KeyShares, func(share utls.KeyShare) bool {
-				return share.Group != utls.X25519MLKEM768
-			})
-		case *utls.SupportedCurvesExtension:
-			ext.Curves = common.Filter(ext.Curves, func(curve utls.CurveID) bool {
-				return curve != utls.X25519MLKEM768
-			})
-		case *utls.RenegotiationInfoExtension:
-			// The parrot's renegotiation_info extension makes uTLS set
-			// Config.Renegotiation = RenegotiateOnceAsClient whenever
-			// the hello state is (re)built, which disables
-			// ConnectionState().ExportKeyingMaterial after the
-			// handshake - and the musess server proof is bound to the
-			// TLS exporter. A GenericExtension emits the identical
-			// wire bytes (type 65281, one zero byte) without the
-			// config side effect.
-			spec.Extensions[i] = &utls.GenericExtension{Id: 65281, Data: []byte{0x00}}
-		}
 	}
 	if err = uConn.ApplyPreset(&spec); err != nil {
 		return nil, nil, err

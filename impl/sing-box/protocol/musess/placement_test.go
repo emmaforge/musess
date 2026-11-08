@@ -8,18 +8,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sagernet/sing/common"
-
 	utls "github.com/metacubex/utls"
 )
 
 // This file is the recorded evidence for the milestone-1 fork-point
 // "auth-tag placement in the ClientHello". Three shapes are compared:
 //
-//	stock  - the tree's uTLS Chrome 120 parrot, untouched
+//	stock  - the tree's uTLS Chrome 133 parrot, untouched
 //	P1     - the shipped construction: ML-KEM share/curve removed so the
 //	         TLS session share is a plain X25519 share whose private key
 //	         doubles as the auth ephemeral; tag in legacy_session_id
+//	         (plus the Chrome 152 wire changes: ML-DSA signature
+//	         algorithms and the trust_anchors extension, as in
+//	         chrome152.go)
 //	P2     - the alternative: same filtering, plus a second, separately
 //	         generated X25519 share appended for the auth exchange
 //
@@ -28,7 +29,7 @@ import (
 
 func buildHello(t *testing.T, mutate func(spec *utls.ClientHelloSpec)) []byte {
 	t.Helper()
-	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_120)
+	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_133)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,17 +64,16 @@ func filterParrot(spec *utls.ClientHelloSpec) {
 	for i, extension := range spec.Extensions {
 		switch ext := extension.(type) {
 		case *utls.KeyShareExtension:
-			ext.KeyShares = common.Filter(ext.KeyShares, func(share utls.KeyShare) bool {
-				return share.Group != utls.X25519MLKEM768
-			})
+			ext.KeyShares = filterKeyShares(ext.KeyShares)
 		case *utls.SupportedCurvesExtension:
-			ext.Curves = common.Filter(ext.Curves, func(curve utls.CurveID) bool {
-				return curve != utls.X25519MLKEM768
-			})
+			ext.Curves = filterCurves(ext.Curves)
+		case *utls.SignatureAlgorithmsExtension:
+			ext.SupportedSignatureAlgorithms = chrome152SignatureAlgorithms()
 		case *utls.RenegotiationInfoExtension:
 			spec.Extensions[i] = &utls.GenericExtension{Id: 65281, Data: []byte{0x00}}
 		}
 	}
+	spec.Extensions = append(spec.Extensions, trustAnchorsExtension())
 }
 
 func extensionTypes(raw []byte) []uint16 {

@@ -19,7 +19,7 @@
 //     go test -run TestAuthPathProbe -v -count=1 ./protocol/musess/
 //
 // The probe builds the ClientHello exactly like the musess outbound
-// (uTLS Chrome 120 parrot, ML-KEM share stripped, auth token in
+// (Chrome 152 parrot, ML-KEM share stripped, auth token in
 // legacy_session_id when PROBE_MODE=auth, random session ID when
 // direct). A tap conn records every server->client byte with a
 // timestamp so NSTs and alerts are visible even though TLS 1.3
@@ -39,7 +39,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sagernet/sing/common"
 	utls "github.com/metacubex/utls"
 )
 
@@ -131,23 +130,10 @@ func probeBuildHello(t *testing.T, rawConn net.Conn, serverName, pubkeyB64, uuid
 		MinVersion:             utls.VersionTLS13,
 	}
 	uConn := utls.UClient(tap, uConfig, utls.HelloCustom)
-	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_120)
+	// Same Chrome 152 parrot as the production outbound (chrome152.go).
+	spec, err := chrome152Spec()
 	if err != nil {
 		t.Fatalf("spec: %v", err)
-	}
-	for i, extension := range spec.Extensions {
-		switch ext := extension.(type) {
-		case *utls.KeyShareExtension:
-			ext.KeyShares = common.Filter(ext.KeyShares, func(share utls.KeyShare) bool {
-				return share.Group != utls.X25519MLKEM768
-			})
-		case *utls.SupportedCurvesExtension:
-			ext.Curves = common.Filter(ext.Curves, func(curve utls.CurveID) bool {
-				return curve != utls.X25519MLKEM768
-			})
-		case *utls.RenegotiationInfoExtension:
-			spec.Extensions[i] = &utls.GenericExtension{Id: 65281, Data: []byte{0x00}}
-		}
 	}
 	if err = uConn.ApplyPreset(&spec); err != nil {
 		t.Fatalf("preset: %v", err)
