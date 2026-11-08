@@ -4,7 +4,7 @@
 # 装好后输入 ms 打开面板（查看链接/重启/状态/卸载）
 # 本脚本直接下载 GitHub Release 里的预编译二进制，不再现场编译 Go（不需要 Go、不需要 git clone）。
 BIN=/usr/local/bin/sing-box-musess; DIR=/etc/musess; CFG=$DIR/server.json; INFO=$DIR/info.env
-REL_TAG=v0.1.0
+REL_TAG=v0.1.1
 
 say(){ printf '%s\n' "$*"; }
 ask(){ printf '%s' "$1"; IFS= read -r REPLY; }
